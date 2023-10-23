@@ -1,0 +1,15 @@
+pydantic<2
+numpy>=1.2
+opencv-python
+gym==0.22.0
+gym[accept-rom-license]==0.22.0
+gym[atari]==0.22.0
+grpcio==1.51.1
+ray[default]==2.1.0
+matplotlib>=3.0.0
+GitPython>=3.0.0
+wandb>=0.14
+moviepy>=1.0.0
+torch>=1.13.0
+torchvision
+torchaudio

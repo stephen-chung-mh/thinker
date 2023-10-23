@@ -223,8 +223,8 @@ int Sokoban::read_level(const int room_id)
 	box_left = 0;
 	done = false;
 
-	char file_name[10];
-	snprintf(file_name, 10, "%03d.txt", room_id / 1000);
+	char file_name[20];
+	snprintf(file_name, 20, "%03d.txt", room_id / 1000);
 	string full_path = level_dir + "//" + file_name;
 	//std::cout << "reading from " << full_path << " level " << room_id << endl;
 	ifstream in(full_path.c_str(), ios::in);

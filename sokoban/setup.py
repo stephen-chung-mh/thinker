@@ -2,13 +2,21 @@
 
 import os, sys
 from setuptools import setup, find_packages, Extension
-import numpy
-import zipfile
+from setuptools.command.build_ext import build_ext
+import zipfile, numpy
 
-try:
-    from Cython.Build import cythonize
-except ImportError:
-    cythonize = None
+class my_build_ext(build_ext):
+    # Override the build_ext command to set inplace=1 by default
+    def initialize_options(self):
+        super().initialize_options()
+        self.inplace = 1
+
+    def build_extensions(self):
+        try:
+            self.compiler.compiler_so.remove("-Wstrict-prototypes")
+        except (AttributeError, ValueError):
+            pass
+        build_ext.build_extensions(self)
 
 # https://cython.readthedocs.io/en/latest/src/userguide/source_files_and_compilation.html#distributing-cython-modules
 def no_cythonize(extensions, **_ignore):
@@ -23,36 +31,46 @@ def no_cythonize(extensions, **_ignore):
         extension.sources[:] = sources
     return extensions
 
+try:
+    from Cython.Build import cythonize
+except ImportError:
+    cythonize = None
+
+CYTHONIZE = cythonize is not None
+#CYTHONIZE = bool(int(os.getenv("CYTHONIZE", 0))) and cythonize is not None
+#CYTHONIZE = False
 
 extensions = [
-    Extension("gym_csokoban.envs.csokoban", ["gym_csokoban/envs/csokoban.pyx"]),
+    Extension(
+        "gym_sokoban.envs.csokoban", 
+        ["gym_sokoban/envs/csokoban.pyx"],
+    ),
 ]
 
-#CYTHONIZE = bool(int(os.getenv("CYTHONIZE", 0))) and cythonize is not None
-CYTHONIZE = True
-
 if CYTHONIZE:
-    #compiler_directives = {"language_level": 3, "embedsignature": True}
-    compiler_directives = {}
+    print("Compiling Cython sources")
+    compiler_directives = {"language_level": 3}
     extensions = cythonize(extensions, compiler_directives=compiler_directives)
 else:
+    print("Not compiling Cython sources")
     extensions = no_cythonize(extensions)
 
 with open("requirements.txt") as fp:
     install_requires = fp.read().strip().split("\n")
 
 setup(
-    name="gym_csokoban",
-    version="0.0.1",
-    packages=["gym_csokoban"],
+    name="gym_sokoban",
+    version="1.0.0",
+    packages=["gym_sokoban"],
     ext_modules=extensions,
     install_requires=install_requires,
-    include_dirs=[".", numpy.get_include()]
+    include_dirs=[".", numpy.get_include()],
+    cmdclass={'build_ext': my_build_ext}
 )
 
 def decompress_data():
     data_zip = os.path.join(os.path.dirname(__file__), 'resources.zip')
-    extract_folder = os.path.join(os.path.dirname(__file__), 'gym_csokoban', 'envs')
+    extract_folder = os.path.join(os.path.dirname(__file__), 'gym_sokoban', 'envs')
     if os.path.exists(os.path.join(extract_folder, 'boxoban-levels')): return        
     
     with zipfile.ZipFile(data_zip, 'r') as zip_ref:

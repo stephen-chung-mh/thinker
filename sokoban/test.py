@@ -3,9 +3,9 @@ import numpy as np
 plt.imshow(np.random.rand(10,10,3))
 
 import gym
-import gym_csokoban
+import gym_sokoban
 
-env = gym.make("cSokoban-v0")
+env = gym.make("Sokoban-v0")
 obs = env.reset()
 obs, reward, done, _ = env.step(2)
 

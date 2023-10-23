@@ -1,8 +1,10 @@
-__version__ = "1.0"
+__version__ = "1.1.0"
+__project__ = "thinker"
 
 import collections
 import time
 import timeit
+import yaml
 import argparse
 import subprocess
 import os
@@ -11,635 +13,240 @@ from matplotlib import pyplot as plt
 import numpy as np
 import torch
 import re
+import sys
 
+def process_flags(flags):
 
-def get_parser():
-    parser = argparse.ArgumentParser(description=f"Thinker v{__version__}")
+    if flags.wrapper_type == 1:
+        flags.rec_t = 1
+        flags.train_model = False
+        flags.im_enable = False
+        flags.cur_enable = False
+        flags.return_h = False
+        flags.return_double = False
 
-    parser.add_argument("--xpid", default=None, help="Experiment id (default: None).")
-    parser.add_argument(
-        "--savedir",
-        default="../logs/thinker",
-        help="Root dir where experiment data will be saved.",
-    )
+    if flags.wrapper_type == 2:
+        flags.dual_net = False
+        flags.cur_enable = False
+        flags.model_rs_loss_cost = 0
+        flags.model_img_loss_cost = 0
+        flags.model_done_loss_cost = 0
 
-    # Logging settings
-    parser.add_argument(
-        "--use_wandb", action="store_true", help="Whether to use wandb logging"
-    )
-    parser.add_argument(
-        "--wandb_ckp_freq",
-        type=int,
-        default=500000,
-        help="Checkpoint frequency of wandb (in real steps) (-1 for not logging).",
-    )
-    parser.add_argument(
-        "--policy_vis_freq",
-        type=int,
-        default=2500000,
-        help="Visualization frequency of wandb (in real steps) (-1 for not logging).",
-    )
-    parser.add_argument(
-        "--policy_vis_length",
-        type=int,
-        default=20,
-        help="Length of visualization (in real steps).",
-    )
-
-    # Environment settings
-    parser.add_argument(
-        "--env", type=str, default="QbertNoFrameskip-v4", help="Gym environment."
-    )
-    parser.add_argument(
-        "--cwrapper",
-        action="store_true",
-        help="Whether to use C++ version of model wrapper",
-    )
-    parser.add_argument(
-        "--reward_clipping", default=1, type=float, help="Reward clipping."
-    )
-    parser.add_argument("--grayscale", action="store_true", help="Grayscale or not.")
-    parser.add_argument(
-        "--frame_wh", default=96, type=int, help="Default wrapping size."
-    )
-    parser.add_argument(
-        "--base_seed", default=1, type=int, help="Base seed of environment."
-    )
-
-    # Resources settings.
-    parser.add_argument(
-        "--disable_auto_res",
-        action="store_true",
-        help="Whether to allocate resources automatically",
-    )
-    parser.add_argument(
-        "--self_play_cpu",
-        action="store_true",
-        help="Whether to use cpu for self-play actors.",
-    )
-    parser.add_argument(
-        "--gpu_learn_actor",
-        default=0.5,
-        type=float,
-        help="Number of gpu per actor learning.",
-    )
-    parser.add_argument(
-        "--gpu_learn_model",
-        default=0.5,
-        type=float,
-        help="Number of gpu per model learning.",
-    )
-    parser.add_argument(
-        "--gpu_self_play",
-        default=0.25,
-        type=float,
-        help="Number of gpu per self-play worker.",
-    )
-    parser.add_argument(
-        "--float16",
-        action="store_true",
-        help="Whether to use float 16 precision in training.",
-    )
-    parser.add_argument(
-        "--gpu_num_actors", default=1, type=int, help="Number of self-play actor (gpu)"
-    )
-    parser.add_argument(
-        "--gpu_num_p_actors",
-        default=32,
-        type=int,
-        help="Number of env per self-play actor (gpu)",
-    )
-    parser.add_argument(
-        "--cpu_num_actors", default=32, type=int, help="Number of self-play actor (cpu)"
-    )
-    parser.add_argument(
-        "--cpu_num_p_actors",
-        default=2,
-        type=int,
-        help="Number of env per self-play actor (cpu)",
-    )
-    parser.add_argument(
-        "--merge_play_model",
-        action="store_true",
-        help="Whether to merge self-play and learn_model processes",
-    )
-    parser.add_argument(
-        "--merge_play_actor",
-        action="store_true",
-        help="Whether to merge self-play and learn_actor processes",
-    )
-    parser.add_argument(
-        "--profile", action="store_true", help="Whether to do profiling"
-    )
-    parser.add_argument(
-        "--ray_mem",
-        default=32,
-        type=float,
-        help="Memory allocated to ray object store in GB.",
-    )
-    parser.add_argument(
-        "--ray_cpu",
-        default=-1,
-        type=int,
-        help="Manually allocate number of cpu for ray.",
-    )
-    parser.add_argument(
-        "--ray_gpu",
-        default=-1,
-        type=int,
-        help="Manually allocate number of gpu for ray.",
-    )
-
-    # Preload settings.
-    parser.add_argument(
-        "--load_checkpoint", default="", help="Load checkpoint directory."
-    )
-    parser.add_argument(
-        "--preload_actor",
-        default="",
-        help="File location of the preload actor network.",
-    )
-    parser.add_argument(
-        "--preload_model",
-        default="",
-        help="File location of the preload model network.",
-    )
-
-    # Actor Training settings.
-    parser.add_argument(
-        "--policy_type",
-        default=0,
-        type=int,
-        help="Policy used for self-play worker; 0 for actor net, 1 for model policy, 2 for 1-step greedy",
-    )
-    parser.add_argument(
-        "--disable_train_actor",
-        action="store_false",
-        dest="train_actor",
-        help="Disable training of actor.",
-    )
-    parser.add_argument(
-        "--total_steps",
-        default=50000000,
-        type=int,
-        help="Total environment steps to train for.",
-    )
-    parser.add_argument(
-        "--batch_size", default=16, type=int, help="Actor learner batch size."
-    )
-    parser.add_argument(
-        "--unroll_length",
-        default=401,
-        type=int,
-        help="The unroll length (time dimension).",
-    )
-    parser.add_argument("--disable_cuda", action="store_true", help="Disable CUDA.")
-
-    # Model Training settings.
-    parser.add_argument(
-        "--disable_train_model",
-        action="store_false",
-        dest="train_model",
-        help="Disable training of model.",
-    )
-    parser.add_argument("--disable_model", action="store_true", help="Disable model.")
-    parser.add_argument(
-        "--model_batch_size", default=128, type=int, help="Model learner batch size."
-    )
-    parser.add_argument(
-        "--model_unroll_length",
-        default=50,
-        type=int,
-        help="Number of transition per unroll in model buffer.",
-    )
-    parser.add_argument(
-        "--model_k_step_return",
-        default=5,
-        type=int,
-        help="Number of recurrent step when training the model.",
-    )
-    parser.add_argument(
-        "--priority_alpha",
-        default=0.6,
-        type=float,
-        help="Alpha used to compute the priority from model buffer; 0. for no priority replay.",
-    )
-    parser.add_argument(
-        "--priority_beta",
-        default=0.4,
-        type=float,
-        help="Initial beta used to compute the priority from model buffer.",
-    )
-    parser.add_argument(
-        "--priority_type",
-        default=2,
-        type=int,
-        help="Type 0: update priority for all time step; Type 1: update priority for the first time step (mean of all error); Type 2: update priority for the first time step (first-step error)",
-    )
-    parser.add_argument(
-        "--model_buffer_n",
-        default=200000,
-        type=int,
-        help="Maximum number of transition in model buffer.",
-    )
-    parser.add_argument(
-        "--model_warm_up_n",
-        default=200000,
-        type=int,
-        help="Number of transition accumulated before model start learning.",
-    )
-    parser.add_argument(
-        "--test_policy_type",
-        default=-1,
-        type=int,
-        help="Policy used for testing model; -1 for no testing, 0 for actor net, 1 for model policy, 2 for 1-step greedy",
-    )
-    parser.add_argument(
-        "--model_min_step_per_transition",
-        default=5,
-        type=float,
-        help="Minimum number of model learning step on one transition",
-    )
-    parser.add_argument(
-        "--model_max_step_per_transition",
-        default=6,
-        type=float,
-        help="Maximum number of model learning step on one transition",
-    )
-
-    # Actor architecture settings
-    parser.add_argument(
-        "--tran_dim", default=128, type=int, help="Size of transformer hidden dim."
-    )
-    parser.add_argument(
-        "--tran_mem_n", default=40, type=int, help="Size of transformer memory."
-    )
-    parser.add_argument(
-        "--tran_layer_n", default=3, type=int, help="Number of transformer layer."
-    )
-    parser.add_argument(
-        "--tran_t",
-        default=1,
-        type=int,
-        help="Number of recurrent step for transformer.",
-    )
-    parser.add_argument(
-        "--tran_lstm_no_attn",
-        action="store_true",
-        help="Whether to disable attention in LSTM-transformer.",
-    )
-    parser.add_argument(
-        "--disable_mem",
-        action="store_true",
-        help="Whether to disable memory for the actor.",
-    )
-    parser.add_argument(
-        "--disable_rnn",
-        action="store_true",
-        help="Whether to disable the entire RNN and use MLP instead.",
-    )
-    parser.add_argument(
-        "--tran_attn_b",
-        default=5,
-        type=float,
-        help="Bias attention for current position.",
-    )
-    parser.add_argument(
-        "--actor_see_type",
-        default=3,
-        type=int,
-        help="What actor sees from model: \
-                            -1 for nothing, \
-                            0 for predicted / true frame, \
-                            1 for predictor's z, \
-                            2 for predictor's h, \
-                            3 for model's h + predictor's h",
-    )
-    parser.add_argument(
-        "--drc", action="store_true", help="DRC baseline; only for disable_model"
-    )
-
-    # Critic architecture settings
-    parser.add_argument(
-        "--critic_zero_init",
-        action="store_true",
-        dest="critic_zero_init",
-        help="Zero initialisation for the critic's output",
-    )
-
-    # Model architecure settings
-    parser.add_argument(
-        "--model_size_nn", default=2, type=int, help="Model size multipler."
-    )
-    parser.add_argument(
-        "--model_downscale_c",
-        default=2.0,
-        type=float,
-        help="Coefficient for downscaling number of channels",
-    )
-    parser.add_argument(
-        "--disable_model_zero_init",
-        action="store_false",
-        dest="model_zero_init",
-        help="Zero initialisation for the model output",
-    )
-    parser.add_argument(
-        "--model_enable_bn",
-        action="store_false",
-        dest="model_disable_bn",
-        help="Whether to disable batch norm in dynamic and output network",
-    )
-    parser.add_argument(
-        "--disable_duel_net",
-        action="store_false",
-        dest="duel_net",
-        help="Whether to use duel net as model",
-    )
-    parser.add_argument(
-        "--disable_frame_copy",
-        action="store_false",
-        dest="frame_copy",
-        help="Whether to copy the last three frames in frame prediction",
-    )
-
-    # Actor loss settings
-    # Real reward setting
-    parser.add_argument(
-        "--entropy_cost", default=0.001, type=float, help="Entropy cost/multiplier."
-    )
-    parser.add_argument(
-        "--baseline_cost", default=0.5, type=float, help="Baseline cost/multiplier."
-    )
-    parser.add_argument(
-        "--reg_cost", default=0.001, type=float, help="Reg cost/multiplier."
-    )
-    parser.add_argument(
-        "--real_cost",
-        default=1,
-        type=float,
-        help="Real reward - real action cost/multiplier.",
-    )
-    parser.add_argument(
-        "--real_im_cost",
-        default=1,
-        type=float,
-        help="Real reward - imagainary action cost/multiplier.",
-    )
-    # Planning reward setting
-    parser.add_argument(
-        "--im_entropy_cost",
-        default=0.00005,
-        type=float,
-        help="Imagainary Entropy cost/multiplier.",
-    )
-    parser.add_argument(
-        "--im_cost",
-        default=1,
-        type=float,
-        help="Imaginary reward cost/multiplier. 0 for no imaginary reward.",
-    )
-    parser.add_argument(
-        "--im_baseline_cost",
-        default=0.5,
-        type=float,
-        help="Baseline cost/multiplier for imaginary reward.",
-    )
-    parser.add_argument(
-        "--disable_im_anneal",
-        action="store_false",
-        dest="im_cost_anneal",
-        help="Whether to anneal im_cost to zero.",
-    )
-
-    # Other reward-related settings
-    parser.add_argument(
-        "--discounting", default=0.99, type=float, help="Discounting factor."
-    )
-    parser.add_argument(
-        "--lamb", default=1, type=float, help="Lambda when computing trace."
-    )
-
-    # Model loss settings
-    parser.add_argument(
-        "--model_logits_loss_cost",
-        default=0.5,
-        type=float,
-        help="Multipler to policy logit loss when training the model.",
-    )
-    parser.add_argument(
-        "--model_vs_loss_cost",
-        default=0.25,
-        type=float,
-        help="Multipler to vs loss when training the model.",
-    )
-    parser.add_argument(
-        "--model_rs_loss_cost",
-        default=1.0,
-        type=float,
-        help="Multipler to rs loss when training the model.",
-    )
-    parser.add_argument(
-        "--model_done_loss_cost",
-        default=1.0,
-        type=float,
-        help="Multipler to done loss when training the model.",
-    )
-    parser.add_argument(
-        "--model_img_loss_cost",
-        default=10.0,
-        type=float,
-        help="Multipler to image reconstruction loss when training the model.",
-    )
-    parser.add_argument(
-        "--model_reg_loss_cost",
-        default=0,
-        type=float,
-        help="Multipler to L2 reg loss for predictor encoding when training the model.",
-    )
-    parser.add_argument(
-        "--model_bootstrap_type",
-        default=0,
-        type=int,
-        help="0 for mean root value, 1 for max root value, 2 for actor's value.",
-    )
-    parser.add_argument(
-        "--model_img_type",
-        default=1,
-        type=int,
-        help="0 for L2 loss on frame; 1 for feature loss on frame.",
-    )
-
-    # Model wrapper settings
-    parser.add_argument(
-        "--perfect_model", action="store_true", help="Whether to use perfect model."
-    )
-    parser.add_argument(
-        "--rec_t", default=20, type=int, help="Number of planning steps K."
-    )
-    parser.add_argument(
-        "--test_rec_t",
-        default=-1,
-        type=int,
-        help="Whether to use a different K in inference.",
-    )
-    parser.add_argument(
-        "--disable_tree_carry",
-        action="store_false",
-        dest="tree_carry",
-        help="Whether to carry over the tree.",
-    )
-    parser.add_argument(
-        "--max_depth", default=5, type=int, help="Maximal search death."
-    )
-    parser.add_argument(
-        "--stat_mask_type",
-        default=0,
-        type=int,
-        help="0: no masking; 1: mask all auxillary node stat; 2: mask all auxillary node stat + v and pi.",
-    )
-
-    # Optimizer settings.
-    parser.add_argument(
-        "--learning_rate",
-        default=0.0006,
-        type=float,
-        help="Learning rate for actor learne.",
-    )
-    parser.add_argument(
-        "--model_learning_rate",
-        default=0.0001,
-        type=float,
-        help="Learning rate for model learner.",
-    )
-    parser.add_argument(
-        "--use_rms", action="store_true", help="Whether to use rms prop instead."
-    )
-    parser.add_argument(
-        "--adam_eps", default=1e-8, type=float, help="Epsilon for Adam optimizer."
-    )
-    parser.add_argument(
-        "--grad_norm_clipping",
-        default=1200,
-        type=float,
-        help="Global gradient norm clip for actor learner.",
-    )
-    parser.add_argument(
-        "--model_grad_norm_clipping",
-        default=0,
-        type=float,
-        help="Global gradient norm clip for model learner.",
-    )
-
-    # Misc
-    parser.add_argument(
-        "--splay_model_update_freq",
-        default=1,
-        type=int,
-        help="Model update frequency for self-play process.",
-    )
-    parser.add_argument(
-        "--splay_actor_update_freq",
-        default=1,
-        type=int,
-        help="Actor update frequency for self-play process.",
-    )
-    parser.add_argument(
-        "--lmodel_model_update_freq",
-        default=1,
-        type=int,
-        help="Model update frequency for model learner.",
-    )
-    return parser
-
-
-def parse(args=None, override=True):
-    parser = get_parser()
-    if args is None:
-        flags = parser.parse_args()
-    else:
-        flags = parser.parse_args(args)
-    return process_flags(flags, override)
-
-
-def process_flags(flags, override=True):
-    if flags.perfect_model:
-        if flags.duel_net:
-            print("Automatically disable duel net (perfect model).")
-            flags.duel_net = False
-        if flags.model_img_loss_cost > 0:
-            print("Automatically setting  model_img_loss_cost = 0 (perfect model).")
-            flags.model_img_loss_cost = 0
-        if flags.model_done_loss_cost > 0:
-            print("Automatically setting  model_done_loss_cost = 0 (perfect model).")
-            flags.model_done_loss_cost = 0
-
-    if flags.disable_model:
-        if flags.rec_t > 1:
-            print("Automatically setting rec_t = 1 (disable model).")
-            flags.rec_t = 1
-        if flags.train_model:
-            print("Automatically disable training model (disable model).")
-            flags.train_model = False
-        if flags.im_cost > 0:
-            print("Automatically setting im_cost = 0 (disable model).")
-            flags.im_cost = 0
-        if flags.actor_see_type != 0:
-            print("Automatically setting actor_see_type = 0 (disable model).")
-            flags.actor_see_type = 0
-
-    if flags.rec_t <= 1:
-        if flags.im_cost > 0:
-            print("Automatically setting im_cost = 0 (no planning steps).")
-            flags.im_cost = 0.0
-
-    if flags.disable_mem:
-        if not flags.tran_lstm_no_attn:
-            print("Automatically disabling attention module (no memory).")
-
-    if "Sokoban" in flags.env and flags.frame_copy:
-        print("Disabling frame copy for non-atari games")
-        flags.frame_copy = False
-
-    assert not (
-        not flags.perfect_model and not flags.duel_net and flags.actor_see_type == 0
-    ), "to see the frame, either use perfect model or duel net"
-
-    fs = ["load_checkpoint", "savedir", "preload_model", "preload_actor"]
-    for f in fs:
-        path = getattr(flags, f)
-        if path:
-            path = os.path.abspath(os.path.expanduser(path))
-            if os.path.islink(path):
-                path = os.readlink(path)
-            setattr(flags, f, path)
-
-    if flags.load_checkpoint and override:
-        check_point_path = os.path.join(flags.load_checkpoint, "ckp_actor.tar")
-        train_checkpoint = torch.load(check_point_path, torch.device("cpu"))
-        flags_ = train_checkpoint["flags"]
-        for k, v in flags_.items():
-            if k not in [
-                "load_checkpoint",
-                "policy_type",
-                "ray_mem",
-                "ray_gpu",
-                "ray_cpu",
-            ]:
-                setattr(flags, k, v)
-
-    if flags.xpid is None:
-        flags.xpid = "thinker-%s" % time.strftime("%Y%m%d-%H%M%S")
-
-    flags.__version__ = __version__
     return flags
 
+def process_flags_actor(flags):    
+    if flags.wrapper_type == 1:
+        flags.see_h = False
+        flags.see_x = False
+        flags.see_tree_rep = False
+    flags.return_h = flags.see_h
+    flags.return_x = flags.see_x
+    if flags.wrapper_type != 0:
+        flags.im_cost = 0.
+        flags.cur_cost = 0.
+    return flags
+
+def alloc_res(flags, gpu_n):
+    if flags.auto_res:
+        flags.self_play_n = [1, 1, 2, 2][gpu_n]
+        flags.env_n = [64, 32, 32, 32][gpu_n]
+        flags.gpu_self_play = [0.25, 0.5, 0.5, 1][gpu_n]
+        flags.gpu_learn_actor = [0.25, 0.5, 1, 1][gpu_n]
+        flags.gpu_learn = [0.5, 1, 1, 1][gpu_n]
+        if not flags.train_model:
+            flags.gpu_learn = 0
+            flags.self_play_n = [2, 2, 2, 2][gpu_n]
+            flags.gpu_self_play = [0.25, 0.5, 1, 1][gpu_n]
+        if not flags.train_actor:
+            flags.gpu_learn_actor = 0
+            flags.self_play_n = [2, 2, 2, 3][gpu_n]
+            flags.gpu_self_play = [0.25, 0.5, 1, 1][gpu_n]
+        if not flags.parallel:
+            flags.self_play_n = 1
+            flags.env_n = 64
+            flags.gpu_self_play = [0.5, 1, 1, 1][gpu_n]
+            flags.gpu_learn_actor = [0.5, 1, 1, 1][gpu_n]
+            flags.gpu_learn = 0
+        if not flags.parallel_actor:
+            flags.self_play_n = 1
+            flags.env_n = flags.actor_batch_size
+            flags.gpu_self_play = [0.5, 1, 1, 1][gpu_n]
+            flags.gpu_learn_actor = 0
+            flags.gpu_learn = [0.5, 1, 1, 1][gpu_n]
+        if not flags.parallel_actor and not flags.parallel:
+            flags.self_play_n = 1
+            flags.env_n = flags.actor_batch_size
+            flags.gpu_self_play = 1
+            flags.gpu_learn_actor = 0
+            flags.gpu_learn = 0
+    return flags
+
+def add_parse(filename, parser=None, prefix=''):
+    # Load default configuration
+    if type(filename) is not list: 
+        filename = [filename]
+    config = {}
+    for n in filename:
+        default_config_path = os.path.join(os.path.dirname(__file__), '..', 'config', n)
+        with open(default_config_path, 'r') as f:
+            config.update(yaml.safe_load(f))
+
+    # Set up command line argument parsing
+    if parser is None:
+        parser = argparse.ArgumentParser(description=f"{__project__} v{__version__}")
+    try:
+        parser.add_argument('--config', type=str, help="Path to user's thinker configuration file")
+    except:
+        # if there is dulplicate key, just ignore
+        pass
+
+    if prefix and prefix[-1] != "_": prefix = prefix + "_"
+    # Dynamically add command line arguments based on the default config keys and their types
+    for key, value in config.items():
+        try:
+            if isinstance(value, bool):
+                parser.add_argument(f'--{prefix}{key}', type=lambda x: (str(x).lower() == 'true'), help=f"Override {key}")
+            else:
+                parser.add_argument(f'--{prefix}{key}', type=type(value), help=f"Override {key}")
+        except:
+            # if there is dulplicate key, just ignore
+            pass
+    return parser
+
+def create_flags(filename, save_flags=True, post_fn=None, **kwargs):
+    """create flags, a namespace object that contains the config; the load
+       order is filename[0], filename[1], ..., kwargs['config'], kwargs       
+       args:
+            filename (str/list of str): the config file(s) to load
+            save_flags (bool): weather to save the flags
+            post_fn (function): a function that takes flags and output flags
+            **kwargs: all other settings 
+       return:
+            flags (namespace): config                
+    """
+    if type(filename) is not list: 
+        filename = [filename]
+
+    config = {}
+    for n in filename:
+        default_config_path = os.path.join(os.path.dirname(__file__), '..', 'config', n)
+        with open(default_config_path, 'r') as f:
+            config.update(yaml.safe_load(f))
+
+    # If user provided their own YAML configuration, load it and update defaults
+    if "config" in kwargs and kwargs["config"]:
+        with open(kwargs["config"], 'r') as f:
+            user_config = yaml.safe_load(f)
+            config.update(user_config)
+
+    # Check for command line argument overrides and apply them
+    for key in config.keys():
+        if key in kwargs and kwargs[key] is not None:
+            config[key] = kwargs[key]            
+
+    # Convert dictionary to named tuple
+    flags = argparse.Namespace(**config)    
+
+    # additional info
+    flags.savedir = flags.savedir.replace("__project__", __project__)    
+    flags.__version__ = __version__
+    flags.cmd = " ".join(sys.argv) 
+
+    try:
+        flags.git_revision = get_git_revision_hash()
+    except Exception:
+        flags.git_revision = None
+
+    if flags.ckp:
+        # load setting from checkpoint yaml    
+        xpid = 'latest' if not flags.xpid else flags.xpid
+        config_path = os.path.join(flags.savedir, xpid, "config_c.yaml")        
+        if os.path.islink(config_path): config_path = os.readlink(config_path)
+        with open(config_path, 'r') as f:
+            config_ = yaml.safe_load(f)
+        for key, value in config_.items():
+            if (key not in ['ckp', 'ray_mem', 'ray_gpu', 'savedir'] and
+                not (key in kwargs and kwargs[key] is not None)):
+                setattr(flags, key, value)
+        print("Loaded config from %s" % config_path)
+
+    if not flags.xpid:        
+        flags.xpid = "%s-%s" % (__project__, time.strftime("%Y%m%d-%H%M%S"))
+
+    flags.ckpdir = os.path.join(flags.savedir, flags.xpid,)     
+
+    flags = process_flags(flags)
+    if post_fn is not None: flags = post_fn(flags)
+
+    if save_flags and not flags.ckp:        
+        ckpdir = full_path(flags.ckpdir)
+        if not os.path.exists(ckpdir):   
+            os.makedirs(ckpdir)        
+        try:
+            # create sym link for the latest run
+            symlink = os.path.join(full_path(flags.savedir), "latest")
+            if os.path.islink(symlink):
+                os.remove(symlink)
+            if not os.path.exists(symlink):
+                os.symlink(flags.ckpdir, symlink)
+                print("Symlinked log directory: %s" % symlink)
+        except OSError:
+            # os.remove() or os.symlink() raced. Don't do anything.
+            pass
+
+        config_path = os.path.join(full_path(flags.savedir), 
+                                   flags.xpid, 
+                                   "config_c.yaml")
+        with open(config_path, 'w') as outfile:
+            yaml.dump(vars(flags), outfile)
+        print("Wrote config file to %s" % config_path)  
+
+    fs = ["savedir", "preload", "ckpdir"]
+    for f in fs:
+        path = getattr(flags, f)
+        if path:            
+            setattr(flags, f, full_path(path))
+    return flags
+
+def create_setting(args=None, save_flags=True, **kwargs):
+    filenames = ['default_thinker.yaml', 'default_actor.yaml']
+    parser = add_parse(filenames)
+    if args is not None:
+        parse_flags = parser.parse_args(args)
+    else:
+        parse_flags = parser.parse_args()
+
+    parse_dict = vars(parse_flags)
+    for key in parse_dict.keys():
+        if key in kwargs and kwargs[key] is not None:
+            parse_dict[key] = kwargs[key]            
+
+    flags = create_flags(filenames, 
+                         save_flags=save_flags, 
+                         post_fn=process_flags_actor, 
+                         **parse_dict)
+    return flags
+
+def full_path(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.islink(path):
+        path = os.readlink(path)
+    return path
 
 def tuple_map(x, f):
-    if type(x) == tuple:
-        return tuple(f(y) if y is not None else None for y in x)
-    else:
-        return type(x)(*(f(y) if y is not None else None for y in x))
+    def process_element(y):
+        # Apply function to dictionary items
+        if isinstance(y, dict):
+            return {k: f(v) if v is not None else None for k, v in y.items()}
+        return f(y) if y is not None else None
 
+    if type(x) == tuple:
+        return tuple(process_element(y) for y in x)
+    else:
+        return type(x)(*(process_element(y) for y in x))
+
+def dict_map(x, f):
+    return {k:f(v) for (k, v) in x.items()}
 
 def safe_view(x, dims):
     if x is None:
@@ -677,47 +284,8 @@ def construct_tuple(x, **kwargs):
 def get_git_revision_hash():
     return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()
 
-
-def decode_model_out(model_out, num_actions, enc_type):
-    idx1 = num_actions * 5 + 5
-    idx2 = num_actions * 10 + 7
-    d = dec if enc_type != 0 else lambda x: x
-    return {
-        "root_action": model_out[0, :, :num_actions],
-        "root_r": d(model_out[0, :, [num_actions]]),
-        "root_v": d(model_out[0, :, [num_actions + 1]]),
-        "root_logits": model_out[0, :, num_actions + 2 : 2 * num_actions + 2],
-        "root_qs_mean": d(model_out[0, :, 2 * num_actions + 2 : 3 * num_actions + 2]),
-        "root_qs_max": d(model_out[0, :, 3 * num_actions + 2 : 4 * num_actions + 2]),
-        "root_ns": model_out[0, :, 4 * num_actions + 2 : 5 * num_actions + 2],
-        "root_trail_r": d(model_out[0, :, [5 * num_actions + 2]]),
-        "root_trail_q": d(model_out[0, :, [5 * num_actions + 3]]),
-        "root_max_v": d(model_out[0, :, [5 * num_actions + 4]]),
-        "cur_action": model_out[0, :, idx1 : idx1 + num_actions],
-        "cur_r": d(model_out[0, :, [idx1 + num_actions]]),
-        "cur_v": d(model_out[0, :, [idx1 + num_actions + 1]]),
-        "cur_logits": model_out[
-            0, :, idx1 + num_actions + 2 : idx1 + 2 * num_actions + 2
-        ],
-        "cur_qs_mean": d(
-            model_out[0, :, idx1 + 2 * num_actions + 2 : idx1 + 3 * num_actions + 2]
-        ),
-        "cur_qs_max": d(
-            model_out[0, :, idx1 + 3 * num_actions + 2 : idx1 + 4 * num_actions + 2]
-        ),
-        "cur_ns": model_out[
-            0, :, idx1 + 4 * num_actions + 2 : idx1 + 5 * num_actions + 2
-        ],
-        "reset": model_out[0, :, idx2],
-        "time": model_out[0, :, idx2 + 1 : -1],
-        "derec": model_out[0, :, [-1]],
-        "raw": model_out[0],
-    }
-
-
 def enc(x):
     return np.sign(x) * (np.sqrt(np.abs(x) + 1) - 1) + (0.001) * x
-
 
 def dec(x):
     return np.sign(x) * (
@@ -726,7 +294,6 @@ def dec(x):
         )
         - 1
     )
-
 
 def optimizer_to(optim, device):
     for param in optim.state.values():
@@ -742,7 +309,6 @@ def optimizer_to(optim, device):
                     if subparam._grad is not None:
                         subparam._grad.data = subparam._grad.data.to(device)
 
-
 def logger():
     formatter = logging.Formatter("%(message)s")
     logger = logging.getLogger("logs/out")
@@ -752,7 +318,6 @@ def logger():
         logger.addHandler(shandle)
     logger.setLevel(logging.INFO)
     return logger
-
 
 class Timings:
     def __init__(self):
@@ -812,7 +377,6 @@ class Timings:
         result += "\nTotal: %.6fms" % (1000 * total)
         return result
 
-
 class Wandb:
     def __init__(self, flags, subname=""):
         import wandb
@@ -826,7 +390,7 @@ class Wandb:
         if m:
             tags.append(m[0])
         self.wandb.init(
-            project="thinker",
+            project=__project__,
             config=flags,
             entity=os.getenv("WANDB_USER", ""),
             reinit=True,
@@ -837,7 +401,6 @@ class Wandb:
             tags=tags,
         )
         self.wandb.config.update(flags, allow_val_change=True)
-
 
 def compute_grad_norm(parameters, norm_type=2.0):
     grads = [p.grad for p in parameters if p.grad is not None]
@@ -851,11 +414,62 @@ def compute_grad_norm(parameters, norm_type=2.0):
     )
     return total_norm
 
+def decode_tree_reps(tree_reps, num_actions, enc_type=0):
+    idx1 = num_actions * 5 + 5
+    idx2 = num_actions * 10 + 7
+    d = dec if enc_type != 0 else lambda x: x
+    if len(tree_reps.shape) == 3:
+        tree_reps = tree_reps[0]
+    return {
+        "root_action": tree_reps[:, :num_actions], # action at root node
+        "root_r": d(tree_reps[:, [num_actions]]), # reward at root node (should be zero)
+        "root_v": d(tree_reps[:, [num_actions + 1]]), # value at root node
+        "root_logits": tree_reps[:, num_actions + 2 : 2 * num_actions + 2], # policy logit at root node
+        "root_qs_mean": d(tree_reps[:, 2 * num_actions + 2 : 3 * num_actions + 2]), # child mean rollout return at root node
+        "root_qs_max": d(tree_reps[:, 3 * num_actions + 2 : 4 * num_actions + 2]), # child max rollout return at root node
+        "root_ns": tree_reps[:, 4 * num_actions + 2 : 5 * num_actions + 2], # visit count at root node
+        "root_trail_r": d(tree_reps[:, [5 * num_actions + 2]]), # trailing sum of reward till the current node
+        "root_trail_q": d(tree_reps[:, [5 * num_actions + 3]]), # trailing rollout return till the current node
+        "root_max_v": d(tree_reps[:, [5 * num_actions + 4]]), # maximum roolout return at the root node
+        "cur_action": tree_reps[:, idx1 : idx1 + num_actions], # all the below are the same as above, except applied to the current node
+        "cur_r": d(tree_reps[:, [idx1 + num_actions]]),
+        "cur_v": d(tree_reps[:, [idx1 + num_actions + 1]]),
+        "cur_logits": tree_reps[
+            :, idx1 + num_actions + 2 : idx1 + 2 * num_actions + 2
+        ],
+        "cur_qs_mean": d(
+            tree_reps[:, idx1 + 2 * num_actions + 2 : idx1 + 3 * num_actions + 2]
+        ),
+        "cur_qs_max": d(
+            tree_reps[:, idx1 + 3 * num_actions + 2 : idx1 + 4 * num_actions + 2]
+        ),
+        "cur_ns": tree_reps[
+            :, idx1 + 4 * num_actions + 2 : idx1 + 5 * num_actions + 2
+        ],
+        "reset": tree_reps[:, idx2], # whether reset is triggered
+        "time": tree_reps[:, idx2 + 1 : -1], # step within current stage
+        "derec": tree_reps[:, [-1]], # accumulated discount
+        "raw": tree_reps, # the raw tree representation
+    }
 
-def plot_gym_env_out(x, ax=None, title=None, savepath=None):
+def mask_tree_rep(tree_reps, num_actions):
+    idx1 = num_actions * 5 + 5
+    idx2 = num_actions * 10 + 7
+    N, C = tree_reps.shape
+    rec_t = (C - 1) - (idx2 + 1)
+    tree_reps_m = torch.zeros(N, 2*num_actions+3+rec_t, device=tree_reps.device)
+    tree_reps_m[:, :num_actions] = tree_reps[:, :num_actions] # root_action
+    tree_reps_m[:, num_actions:2*num_actions] = tree_reps[:, idx1 : idx1 + num_actions] # cur_action
+    tree_reps_m[:, 2*num_actions] = tree_reps[:, idx2] # reset_action
+    tree_reps_m[:, 2*num_actions+1] = tree_reps[:, idx1 + num_actions] # imagainary reward
+    tree_reps_m[:, 2*num_actions+2] = tree_reps[:, -1] # deprec
+    tree_reps_m[:, 2*num_actions+3:] = tree_reps[:, idx2 + 1 : -1] # time    
+    return tree_reps_m
+
+def plot_raw_state(x, ax=None, title=None, savepath=None):
     if ax is None:
         _, ax = plt.subplots()
-    x = torch.swapaxes(torch.swapaxes(x[0, -3:].detach().cpu(), 0, 2), 0, 1).numpy()
+    x = torch.swapaxes(torch.swapaxes(x[-3:].detach().cpu(), 0, 2), 0, 1).numpy()
     if x.dtype == float:
         x = np.clip(x, 0, 1)
     if x.dtype == int:
@@ -866,8 +480,3 @@ def plot_gym_env_out(x, ax=None, title=None, savepath=None):
     if savepath is not None:
         plt.savefig(os.path.join(savepath, title + ".png"))
         plt.close()
-
-
-def print_mem(prefix):
-    pass
-    # print(f"{prefix} Allocated: {torch.cuda.memory_allocated(torch.device('cuda')) / (1024**3):.2f} GB, Reserved: {torch.cuda.memory_reserved(torch.device('cuda')) / (1024**3):.2f} GB, Max Allocated: {torch.cuda.max_memory_allocated(torch.device('cuda')) / (1024**3):.2f} GB, Max Reserved: {torch.cuda.max_memory_reserved(torch.device('cuda')) / (1024**3):.2f} GB")

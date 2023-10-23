@@ -249,7 +249,7 @@ class ConvAttnLSTM(nn.Module):
 
         self.layers = nn.ModuleList(layers)
 
-    def init_state(self, bsz, device=None):
+    def initial_state(self, bsz, device=None):
         core_state = ()
         for _ in range(self.num_layers):
             core_state = core_state + (

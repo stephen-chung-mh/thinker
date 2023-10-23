@@ -16,23 +16,23 @@ class Sokoban {
 public:
 	Sokoban() = default;
 	Sokoban(bool small, string level_dir, string img_dir, int level_num, unsigned int seed = 0) :
-		player_pos_x(0),
-		player_pos_y(0),
-		box_left(0),
-		step_n(0),		
 		img_x(small ? small_img_x : large_img_x),
 		img_y(small ? small_img_x : large_img_x),
 		obs_x((small ? small_img_x : large_img_x)* room_x),
 		obs_y((small ? small_img_x : large_img_x)* room_y),
 		obs_n((small ? small_img_x * small_img_x : large_img_x * large_img_x)* room_x* room_y * 3),
-		level_dir(level_dir),
-		img_dir(img_dir),
+		step_n(0),		
+		seed(seed),
+		player_pos_x(0),
+		player_pos_y(0),
+		box_left(0),
 		done(false),
 		small(small),
-		room_status(),
-		spirites(),
 		level_num(level_num),
-		seed(seed){
+		level_dir(level_dir),
+		img_dir(img_dir),
+		room_status(),
+		spirites(){
 		read_spirits();
 	};
 	static constexpr int room_x = 10, room_y = 10, small_img_x = 8, small_img_y = 8, large_img_x = 16, large_img_y = 16;

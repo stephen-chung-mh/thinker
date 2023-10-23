@@ -1,10 +1,9 @@
 # distutils: language = c++
 import numpy as np
 import gym
+from gym import spaces
 import torch
-#from thinker import util
 import thinker.util as util
-from thinker.net import ModelNetOut
 
 import cython
 from libcpp cimport bool
@@ -160,26 +159,27 @@ cdef void node_propagate(Node* pnode, float r, float v, bool new_rollout, vector
         node_propagate(pnode[0].pparent, r, v, new_rollout, ppath=ppath_)
 
 #@cython.cdivision(True)
-cdef float[:] node_stat(Node* pnode, bool detailed, int mask_type):
+cdef float[:] node_stat(Node* pnode, bool detailed, int enc_type, int mask_type):
     cdef float[:] result = np.zeros((pnode[0].num_actions*5+5) if detailed else (pnode[0].num_actions*5+2), dtype=np.float32) 
     cdef int i
     result[pnode[0].action] = 1. # action
-    result[pnode[0].num_actions] = pnode[0].r # reward
+    f = lambda x:x if enc_type == 0 else enc
+    result[pnode[0].num_actions] = f(pnode[0].r) # reward
     if not mask_type in [2]: 
-        result[pnode[0].num_actions+1] = pnode[0].v # value
+        result[pnode[0].num_actions+1] = f(pnode[0].v) # value
     for i in range(int(pnode[0].ppchildren[0].size())):
         child = pnode[0].ppchildren[0][i][0]
         if not mask_type in [2]: 
             result[pnode[0].num_actions+2+i] = child.logit # child_logits
         if not mask_type in [1, 2]: 
-            result[pnode[0].num_actions*2+2+i] = average(child.prollout_qs[0]) # child_rollout_qs_mean
-            result[pnode[0].num_actions*3+2+i] = maximum(child.prollout_qs[0]) # child_rollout_qs_max
+            result[pnode[0].num_actions*2+2+i] = f(average(child.prollout_qs[0])) # child_rollout_qs_mean
+            result[pnode[0].num_actions*3+2+i] = f(maximum(child.prollout_qs[0])) # child_rollout_qs_max
             result[pnode[0].num_actions*4+2+i] = child.rollout_n / <float>pnode[0].rec_t # child_rollout_ns_enc
-    if detailed and not mask_type in [1, 2]:
-        pnode[0].max_q = (maximum(pnode[0].prollout_qs[0]) - pnode[0].r) / pnode[0].discounting
-        result[pnode[0].num_actions*5+2] = pnode[0].trail_r / pnode[0].discounting
-        result[pnode[0].num_actions*5+3] = pnode[0].rollout_q / pnode[0].discounting
-        result[pnode[0].num_actions*5+4] = pnode[0].max_q
+    pnode[0].max_q = (maximum(pnode[0].prollout_qs[0]) - pnode[0].r) / pnode[0].discounting
+    if detailed and not mask_type in [1, 2]:        
+        result[pnode[0].num_actions*5+2] = f(pnode[0].trail_r / pnode[0].discounting)
+        result[pnode[0].num_actions*5+3] = f(pnode[0].rollout_q / pnode[0].discounting)
+        result[pnode[0].num_actions*5+4] = f(pnode[0].max_q)
     return result
 
 cdef node_del(Node* pnode, int except_idx):
@@ -201,7 +201,20 @@ cdef node_del(Node* pnode, int except_idx):
         Py_DECREF(<object>pnode[0].encoded)
     free(pnode)
 
-cdef class cVecFullModelWrapper():
+cdef float enc(float x):
+    return sign(x)*(sqrt(abs(x)+1)-1)+(0.001)*x
+
+cdef float sign(float x):
+    if x > 0.: return 1.
+    if x < 0.: return -1.
+    return 0.
+
+cdef float abs(float x):
+    if x > 0.: return x
+    if x < 0.: return -x
+    return 0.
+
+cdef class cModelWrapper():
     """Wrap the gym environment with a model; output for each 
     step is (out, reward, done, info), where out is a tuple 
     of (gym_env_out, model_out, model_encodes) that corresponds to underlying 
@@ -212,29 +225,40 @@ cdef class cVecFullModelWrapper():
     cdef int rec_t
     cdef int rep_rec_t
     cdef float discounting
-    cdef int max_allow_depth
-    cdef bool perfect_model
-    cdef bool tree_carry  
-    cdef int actor_see_type
-    cdef bool actor_see_double_encode 
+    cdef int max_depth    
+    cdef bool tree_carry    
+
+    cdef int enc_type
     cdef bool pred_done
     cdef int num_actions
     cdef int obs_n    
     cdef int env_n
+    
+    cdef bool return_h
+    cdef bool return_x
+    cdef bool return_double
+
     cdef bool im_enable
-    cdef bool time 
+    cdef bool cur_enable
+    cdef float cur_reward_cost
+    cdef float cur_v_cost
+    cdef float cur_enc_cost
+    cdef bool cur_done_gate
+    
     cdef int stat_mask_type
-    cdef bool debug
+    cdef bool time 
 
     # python object
     cdef object device
     cdef object env
     cdef object timings
-    cdef readonly baseline_max_q
-    cdef readonly baseline_mean_q    
-    cdef readonly object model_out_shape
-    cdef readonly object gym_env_out_shape
-    cdef readonly object xs
+    cdef object real_states
+    cdef object baseline_mean_q    
+
+    cdef readonly object observation_space
+    cdef readonly object action_space
+    cdef readonly object reward_range
+    cdef readonly object metadata
 
     # tree statistic
     cdef vector[Node*] cur_nodes
@@ -245,24 +269,25 @@ cdef class cVecFullModelWrapper():
     cdef int[:] max_rollout_depth
     cdef int[:] cur_t
 
-    # internal variables only used in step function
-    cdef float[:] depth_delta
+    # internal variables only used in step function    
     cdef int[:] max_rollout_depth_
     cdef float[:] mean_q
     cdef float[:] max_q
     cdef int[:] status
     cdef vector[Node*] cur_nodes_
     cdef float[:] par_logits
-    cdef float[:, :] full_reward
+    cdef float[:] full_reward
+    cdef float[:] full_im_reward
+    cdef float[:] full_cur_reward
     cdef bool[:] full_done
+    cdef bool[:] full_im_done
     cdef bool[:] full_real_done
     cdef bool[:] full_truncated_done
-    cdef int[:] total_step    
+    cdef int[:] step_status
+    cdef int[:] total_step  
 
-    def __init__(self, env, env_n, flags, device=None, time=False, debug=False):
-        assert not flags.perfect_model, "this class only supports imperfect model"
-        self.device = torch.device("cpu") if device is None else device
-        self.env = env     
+    def __init__(self, env, env_n, flags, model_net, device=None, time=False):        
+           
         if flags.test_rec_t > 0:
             self.rec_t = flags.test_rec_t
             self.rep_rec_t = flags.rec_t         
@@ -270,39 +295,76 @@ cdef class cVecFullModelWrapper():
             self.rec_t = flags.rec_t           
             self.rep_rec_t = flags.rec_t         
         self.discounting = flags.discounting
-        self.max_allow_depth = flags.max_depth
-        self.perfect_model = flags.perfect_model
+        self.max_depth = flags.max_depth
         self.tree_carry = flags.tree_carry
-        self.num_actions = env.action_space[0].n
-        self.im_enable = flags.im_cost > 0.
-        self.actor_see_type = flags.actor_see_type  
-        self.actor_see_double_encode = False
-        self.pred_done = flags.model_done_loss_cost > 0.
-        self.stat_mask_type = flags.stat_mask_type
-        self.env_n = env_n
-        self.obs_n = 9 + self.num_actions * 10 + self.rep_rec_t
-        self.model_out_shape = (self.obs_n, 1, 1)
-        self.gym_env_out_shape = env.observation_space.shape[1:]
 
-        self.baseline_max_q = torch.zeros(self.env_n, dtype=torch.float32, device=self.device)
-        self.baseline_mean_q = torch.zeros(self.env_n, dtype=torch.float32, device=self.device)        
+        self.enc_type = flags.model_enc_type
+        self.pred_done = flags.model_done_loss_cost > 0.        
+        self.num_actions = env.action_space[0].n
+        self.obs_n = 9 + self.num_actions * 10 + self.rep_rec_t
+        self.env_n = env_n
+
+        self.return_h = flags.return_h  
+        self.return_x = flags.return_x  
+        self.return_double = flags.return_double
+
+        self.im_enable = flags.im_enable
+        self.cur_enable = flags.cur_enable
+        self.cur_reward_cost = flags.cur_reward_cost
+        self.cur_v_cost = flags.cur_v_cost
+        self.cur_enc_cost = flags.cur_enc_cost
+        self.cur_done_gate = flags.cur_done_gate
+
+        self.stat_mask_type = flags.stat_mask_type
         self.time = time        
-        self.timings = util.Timings()
-        self.debug = debug
+        
+        self.device = torch.device("cpu") if device is None else device        
+        self.env = env  
+        self.timings = util.Timings()        
+
+        self.observation_space = {
+            "tree_reps": spaces.Box(low=-np.inf, high=np.inf, shape=(self.env_n, self.obs_n), 
+                dtype=np.float32),
+            "real_states": self.env.observation_space,
+        }
+
+        if self.return_x:
+            xs_shape = list(self.env.observation_space.shape)
+            if self.return_double:
+                xs_shape[1] *= 2
+            xs_space = spaces.Box(low=0., high=1., shape=xs_shape, dtype=np.float32)
+            self.observation_space["xs"] = xs_space
+
+        if self.return_h:
+            hs_shape = [env_n,] + list(model_net.hidden_shape)
+            if self.return_double:
+                hs_shape[1] *= 2
+            hs_space = spaces.Box(low=-np.inf, high=np.inf, shape=hs_shape, dtype=np.float32)
+            self.observation_space["hs"] = hs_space
+
+        self.observation_space = spaces.Dict(self.observation_space)
+
+        aug_action_space = spaces.Tuple((spaces.Discrete(self.num_actions),)*self.env_n)
+        reset_space = spaces.Tuple((spaces.Discrete(2),)*self.env_n)
+        self.action_space = spaces.Tuple((aug_action_space, reset_space))
+        self.reward_range = env.reward_range
+        self.metadata = env.metadata
 
         # internal variable init.
-        self.depth_delta = np.zeros(self.env_n, dtype=np.float32)
         self.max_rollout_depth_ = np.zeros(self.env_n, dtype=np.intc)
         self.mean_q =  np.zeros(self.env_n, dtype=np.float32)
         self.max_q = np.zeros(self.env_n, dtype=np.float32)
         self.status = np.zeros(self.env_n, dtype=np.intc)
         self.par_logits = np.zeros(self.num_actions, dtype=np.float32)
-        self.full_reward = np.zeros((self.env_n, 1 + int(self.im_enable)), 
-            dtype=np.float32)
-        self.full_done = np.zeros(self.env_n, dtype=np.bool)
-        self.full_real_done = np.zeros(self.env_n, dtype=np.bool)
-        self.full_truncated_done = np.zeros(self.env_n, dtype=np.bool)
+        self.full_reward = np.zeros(self.env_n, dtype=np.float32)
+        self.full_im_reward = np.zeros(self.env_n, dtype=np.float32)
+        self.full_cur_reward = np.zeros(self.env_n, dtype=np.float32)
+        self.full_done = np.zeros(self.env_n, dtype=np.bool_)
+        self.full_im_done = np.zeros(self.env_n, dtype=np.bool_)
+        self.full_real_done = np.zeros(self.env_n, dtype=np.bool_)
+        self.full_truncated_done = np.zeros(self.env_n, dtype=np.bool_)
         self.total_step = np.zeros(self.env_n, dtype=np.intc)
+        self.step_status = np.zeros(self.env_n, dtype=np.intc)       
         
     def reset(self, model_net):
         """reset the environment; should only be called in the initial"""
@@ -318,6 +380,7 @@ cdef class cVecFullModelWrapper():
             self.rollout_depth = np.zeros(self.env_n, dtype=np.intc)
             self.max_rollout_depth = np.zeros(self.env_n, dtype=np.intc)
             self.cur_t = np.zeros(self.env_n, dtype=np.intc)
+            self.baseline_mean_q = torch.zeros(self.env_n, dtype=torch.float, device=self.device)        
 
             # reset obs
             obs = self.env.reset()
@@ -327,7 +390,10 @@ cdef class cVecFullModelWrapper():
             pass_action = torch.zeros(self.env_n, dtype=torch.long)
             model_net_out = model_net(obs_py, 
                                       pass_action.unsqueeze(0).to(self.device), 
-                                      one_hot=False)  
+                                      one_hot=False,
+                                      ret_xs=self.return_x,
+                                      ret_zs=False,
+                                      ret_hs=self.return_h)  
             vs = model_net_out.vs.cpu()
             logits = model_net_out.logits.cpu()      
 
@@ -335,8 +401,9 @@ cdef class cVecFullModelWrapper():
             for i in range(self.env_n):
                 root_node = node_new(pparent=NULL, action=pass_action[i].item(), logit=0., num_actions=self.num_actions, 
                     discounting=self.discounting, rec_t=self.rec_t, remember_path=True)                
-                encoded = {"gym_env_out": obs_py[i], 
-                           "model_ys": model_net_out.ys[-1,i] if self.actor_see_type >= 0 else None,
+                encoded = {"real_states": obs_py[i],
+                           "xs": model_net_out.xs[-1, i] if model_net_out.xs is not None else None,
+                           "hs": model_net_out.hs[-1, i] if model_net_out.hs is not None else None,
                            "model_states": dict({sk:sv[[i]] for sk, sv in model_net_out.state.items()})
                           }  
                 node_expand(pnode=root_node, r=0., v=vs[-1, i].item(), t=self.total_step[i], done=False,
@@ -345,38 +412,15 @@ cdef class cVecFullModelWrapper():
                 self.root_nodes.push_back(root_node)
                 self.cur_nodes.push_back(root_node)
             
-            # compute model_out
-            model_out = self.compute_model_out(None, None)
-
-            gym_env_out = []
-            for i in range(self.env_n):
-                encoded = <dict>self.cur_nodes[i][0].encoded
-                if encoded["gym_env_out"] is not None:
-                    gym_env_out.append(encoded["gym_env_out"].unsqueeze(0))
-            if len(gym_env_out) > 0:
-                gym_env_out = torch.concat(gym_env_out)
-            else:
-                gym_env_out = None
-
-            if self.actor_see_type >= 0:
-                model_encodes = self.compute_model_encodes(self.cur_nodes)
-                if self.actor_see_double_encode:
-                    model_encodes = torch.concat([model_encodes, model_encodes], dim=1)
-            else:
-                model_encodes = None
-
-            if self.debug:
-                self.xs =  self.compute_model_xs(self.cur_nodes)
-
             # record initial root_nodes_qmax 
             for i in range(self.env_n):
                 self.root_nodes_qmax[i] = self.root_nodes[i][0].max_q
             
-            return torch.tensor(model_out, dtype=torch.float32, device=self.device), gym_env_out, model_encodes
+            states = self.prepare_state(None, None)
+
+            return states
 
     def step(self, action, model_net):  
-        # action is tensor of shape (env_n, 3)
-        # which corresponds to real_action, im_action, reset, term
         
         cdef int i, j, k, l
         cdef int[:] re_action
@@ -405,15 +449,38 @@ cdef class cVecFullModelWrapper():
         cdef float[:,:] logits_4
 
         if self.time: self.timings.reset()
-        action = action.cpu().int().numpy()
-        re_action, im_action, reset = action[:, 0], action[:, 1], action[:, 2]
+
+        assert type(action) is tuple and len(action) == 2, \
+            "action should be a tuple of size 2, containing augmented action and reset"        
+        for i in range(len(action)):
+            a = action[i]            
+            assert torch.is_tensor(a) or \
+                isinstance(a, np.ndarray) or \
+                isinstance(a, list), \
+                f"action[{i}] should be either torch.tensor or np.ndarray or list"            
+            if torch.is_tensor(a):
+                a = a.detach().cpu().numpy()
+            if isinstance(a, list):
+                a = np.array(a, dtype=np.int32)
+            assert a.shape == (self.env_n,), \
+                f"action[{i}] shape should be {(self.env_n,)}, not {a.shape}"
+            if a.dtype != np.int32:
+                a = a.astype(np.int32)
+            if i == 0:
+                re_action = a
+                im_action = a
+                assert (a >= 0).all() and (a < self.num_actions).all(), \
+                    f"primiary action should be in [0, {self.num_actions-1}], not {a}"
+            else:
+                reset = a       
+                assert (a >= 0).all() and (a < 2).all(), \
+                    f"reset action should be in [0, 1], not {a}"  
 
         pass_model_states, pass_re_model_states = [], []
 
         for i in range(self.env_n):            
             # compute the mask of real / imagination step                             
-            self.max_rollout_depth_[i] = self.max_rollout_depth[i]
-            self.depth_delta[i] = 1.
+            self.max_rollout_depth_[i] = self.max_rollout_depth[i]            
             if self.cur_t[i] < self.rec_t - 1: # imagaination step
                 self.cur_t[i] += 1
                 self.rollout_depth[i] += 1
@@ -434,14 +501,13 @@ cdef class cVecFullModelWrapper():
                 self.max_rollout_depth[i] = 0
                 self.total_step[i] = self.total_step[i] + 1
                 # record baseline before moving on
-                self.baseline_mean_q[i] = average(self.root_nodes[i][0].prollout_qs[0]) / self.discounting
-                self.baseline_max_q[i] = maximum(self.root_nodes[i][0].prollout_qs[0]) / self.discounting
+                self.baseline_mean_q[i] = average(self.root_nodes[i][0].prollout_qs[0]) / self.discounting                
                 encoded = <dict> self.root_nodes[i][0].encoded
                 pass_re_model_states.append(encoded["model_states"])
                 pass_inds_restore.push_back(i)
                 pass_action.push_back(re_action[i])                
                 pass_inds_step.push_back(i)
-                self.status[i] = 1                              
+                self.status[i] = 1            
         if self.time: self.timings.time("misc_1")
 
         # one step of env
@@ -454,7 +520,7 @@ cdef class cVecFullModelWrapper():
         # reset needed?
         for i, j in enumerate(pass_inds_step):
             if done[i]:
-                pass_inds_reset.push_back(j)
+                pass_inds_reset.push_back(j)                
                 pass_inds_reset_.push_back(i) # index within pass_inds_step
 
         # reset
@@ -468,10 +534,42 @@ cdef class cVecFullModelWrapper():
         if pass_inds_step.size() > 0:
             with torch.no_grad():
                 obs_py = torch.tensor(obs, dtype=torch.uint8, device=self.device)
+                pass_action_py = torch.tensor(pass_action, dtype=long, device=self.device).unsqueeze(0)
                 model_net_out_1 = model_net(obs_py, 
-                        torch.tensor(pass_action, dtype=long, device=self.device).unsqueeze(0), 
+                        pass_action_py, 
                         one_hot=False,
-                        ret_zs=False)                      
+                        ret_xs=self.return_x,
+                        ret_zs=self.cur_enable,
+                        ret_hs=self.return_h)  
+                if self.cur_enable:
+                    pass_re_model_states = dict({msd: torch.concat([ms[msd] for ms in pass_re_model_states], dim=0)
+                        for msd in pass_re_model_states[0].keys()})
+                    pred_model_net_out_1 = model_net.forward_single(
+                        state=pass_re_model_states,
+                        action=torch.tensor(pass_action, dtype=long, device=self.device),  
+                        one_hot=False,  
+                        ret_xs=False,
+                        ret_zs=True,
+                        ret_hs=False,
+                    )                                       
+                    cur_reward = 0.
+                    done_mask = torch.tensor(done, dtype=torch.float, device=self.device)
+                    if self.cur_v_cost > 0.:
+                        pred_model_net_out_1.vs[pred_model_net_out_1.dones] = 0.
+                        cur_reward += self.cur_v_cost * torch.square(model_net_out_1.vs[-1] * (1-done_mask) - pred_model_net_out_1.vs[-1])
+                    if self.cur_reward_cost > 0.:
+                        pred_model_net_out_1.rs[pred_model_net_out_1.dones] = 0.
+                        cur_reward += self.cur_reward_cost * torch.square(torch.tensor(reward, device=self.device) * (1-done_mask) - pred_model_net_out_1.rs[-1])
+                    if self.cur_enc_cost > 0.:
+                        flat_dim = tuple(range(1, len(model_net_out_1.zs[-1].shape)))     
+                        done_mask_ = done_mask
+                        for _ in range(len(model_net_out_1.zs.shape)-2): done_mask_ = done_mask_.unsqueeze(-1)
+                        pred_model_net_out_1.zs[pred_model_net_out_1.dones] = 0.     
+                        cur_reward += self.cur_enc_cost * torch.mean(torch.square(model_net_out_1.zs[-1] * (1-done_mask_) - pred_model_net_out_1.zs[-1]), dim=flat_dim)
+                    if self.cur_done_gate:
+                        done_mask = torch.tensor(done, dtype=torch.bool, device=self.device)
+                        cur_reward[torch.logical_or(done_mask, pred_model_net_out_1.dones[-1])] = 0.
+                    cur_reward = cur_reward.float().cpu().numpy()                    
                     
             vs_1 = model_net_out_1.vs[-1].float().cpu().numpy()
             logits_1 = model_net_out_1.logits[-1].float().cpu().numpy()
@@ -483,10 +581,14 @@ cdef class cVecFullModelWrapper():
                 pass_model_states = dict({msd: torch.concat([ms[msd] for ms in pass_model_states], dim=0)
                         for msd in pass_model_states[0].keys()})
                     # all batch index are in the first index 
+                pass_model_action_py = torch.tensor(pass_model_action, dtype=long, device=self.device)
                 model_net_out_4 = model_net.forward_single(
-                    state = pass_model_states,
-                    action = torch.tensor(pass_model_action, dtype=long, device=self.device),                     
-                    one_hot = False,)  
+                    state=pass_model_states,
+                    action=pass_model_action_py,                     
+                    one_hot=False,
+                    ret_xs=self.return_x,
+                    ret_zs=False,
+                    ret_hs=self.return_h)  
             rs_4 = model_net_out_4.rs[-1].float().cpu().numpy()
             vs_4 = model_net_out_4.vs[-1].float().cpu().numpy()
             logits_4 = model_net_out_4.logits[-1].float().cpu().numpy()
@@ -502,8 +604,9 @@ cdef class cVecFullModelWrapper():
                 # real transition
                 new_root = (not self.tree_carry or 
                     not node_expanded(self.root_nodes[i][0].ppchildren[0][re_action[i]], -1) or done[j])
-                encoded = {"gym_env_out": obs_py[j], 
-                           "model_ys": model_net_out_1.ys[-1,j] if self.actor_see_type >= 0 else None,
+                encoded = {"real_states": obs_py[j], 
+                           "xs": model_net_out_1.xs[-1, j] if model_net_out_1.xs is not None else None,
+                           "hs": model_net_out_1.hs[-1, j] if model_net_out_1.hs is not None else None,
                            "model_states": dict({sk:sv[[j]] for sk, sv in model_net_out_1.state.items()})
                           }         
                 if new_root:
@@ -544,8 +647,9 @@ cdef class cVecFullModelWrapper():
             
             elif self.status[i] == 4:
                 # need expand
-                encoded = {"gym_env_out": None, 
-                           "model_ys": model_net_out_4.ys[-1,l] if self.actor_see_type >= 0 else None,
+                encoded = {"real_states": None, 
+                           "xs": model_net_out_4.xs[-1, l] if model_net_out_4.xs is not None else None,
+                           "hs": model_net_out_4.hs[-1, l] if model_net_out_4.hs is not None else None,
                            "model_states": dict({sk:sv[[l]] for sk, sv in model_net_out_4.state.items()})
                            }
                 cur_node = self.cur_nodes[i][0].ppchildren[0][im_action[i]]
@@ -568,126 +672,157 @@ cdef class cVecFullModelWrapper():
         if self.time: self.timings.time("compute_root_cur_nodes")
 
         # reset if serach depth exceeds max depth
-        if self.max_allow_depth > 0:
+        if self.max_depth > 0:
             for i in range(self.env_n):
-                if self.rollout_depth[i] >= self.max_allow_depth:
-                    action[i, 2] = 1
+                if self.rollout_depth[i] >= self.max_depth:
                     reset[i] = 1
 
-        # compute model_out        
-        model_out = self.compute_model_out(action, self.status)
-        gym_env_out = []
-        for i in range(self.env_n):
-            encoded = <dict>self.cur_nodes[i][0].encoded
-            if encoded["gym_env_out"] is not None:
-                gym_env_out.append(encoded["gym_env_out"].unsqueeze(0))
-        if len(gym_env_out) > 0:
-            gym_env_out = torch.concat(gym_env_out)
-        else:
-            gym_env_out = None
-
-        if self.actor_see_type >= 0:
-            model_encodes = self.compute_model_encodes(self.cur_nodes)
-            if self.actor_see_double_encode:
-                model_encodes_ = self.compute_model_encodes(self.root_nodes)
-                model_encodes = torch.concat([model_encodes, model_encodes_], dim=1)
-        else:
-            model_encodes = None
-        if self.debug:
-            self.xs =  self.compute_model_xs(self.cur_nodes)
-        if self.time: self.timings.time("compute_model_out")
+        # compute states        
+        states = self.prepare_state(reset, self.status)
+        if self.time: self.timings.time("compute_state")
         # compute reward
         j = 0
         for i in range(self.env_n):
             # real reward
             if self.status[i] == 1:
-                self.full_reward[i][0] = reward[j]
+                self.full_reward[i] = reward[j]
             else:
-                self.full_reward[i][0] = 0.
+                self.full_reward[i] = 0.
             # planning reward
             if self.im_enable:                        
                 self.root_nodes_qmax_[i] = self.root_nodes[i][0].max_q
                 if self.status[i] != 1:                
-                    self.full_reward[i][1] = (self.root_nodes_qmax_[i] - self.root_nodes_qmax[i])*self.depth_delta[i]
-                    if self.full_reward[i][1] < 0: self.full_reward[i][1] = 0
+                    self.full_im_reward[i] = (self.root_nodes_qmax_[i] - self.root_nodes_qmax[i])
+                    if self.full_im_reward[i] < 0: self.full_im_reward[i] = 0
                 else:
-                    self.full_reward[i][1] = 0.
+                    self.full_im_reward[i] = 0.
                 self.root_nodes_qmax[i] = self.root_nodes_qmax_[i]
+            # curisotiy reward
+            if self.cur_enable:
+                if self.status[i] == 1: 
+                    self.full_cur_reward[i] = cur_reward[j]
+                else:                    
+                    self.full_cur_reward[i] = 0
             if self.status[i] == 1:
                 j += 1
         if self.time: self.timings.time("compute_reward")
-        # compute done & full_real_done
+        
         j = 0
         for i in range(self.env_n):
+            # compute done & full_real_done
             if self.status[i] == 1:
                 self.full_done[i] = done[j]
                 self.full_real_done[i] = real_done[j]
                 self.full_truncated_done[i] = truncated_done[j]
+                self.full_im_done[i] = False
             else:
                 self.full_done[i] = False
                 self.full_real_done[i] = False
                 self.full_truncated_done[i] = False
+                self.full_im_done[i] = self.cur_nodes[i][0].done
             if self.status[i] == 1:
                 j += 1
-        # compute reset
-        for i in range(self.env_n):
+
+            # compute reset        
             if reset[i]:
                 self.rollout_depth[i] = 0
                 self.cur_nodes[i] = self.root_nodes[i]
                 node_visit(self.cur_nodes[i])
                 self.status[i] = 5 
+
+            # compute step status
+            if self.cur_t[i] == 0:
+                self.step_status[i] = 0 # real action just taken
+            elif self.cur_t[i] < self.rec_t - 1:
+                self.step_status[i] = 1 # im action just taken
+            elif self.cur_t[i] >= self.rec_t - 1:
+                self.step_status[i] = 2 # im action just taken; next action is real action
+
         # some extra info
-        info = {"cur_t": torch.tensor(self.cur_t, dtype=torch.long, device=self.device),
+        info = {
+                "real_done": torch.tensor(self.full_real_done, dtype=torch.float, device=self.device).bool(),
+                "truncated_done": torch.tensor(self.full_truncated_done, dtype=torch.float, device=self.device).bool(),
+                #"im_done": torch.tensor(self.full_im_done, dtype=torch.float, device=self.device).bool(),
+                "step_status": torch.tensor(self.step_status, device=self.device),
                 "max_rollout_depth":  torch.tensor(self.max_rollout_depth_, dtype=torch.long, device=self.device),
-                "real_done": torch.tensor(self.full_real_done, dtype=torch.bool, device=self.device),
-                "truncated_done": torch.tensor(self.full_truncated_done, dtype=torch.bool, device=self.device),}
+                "baseline": self.baseline_mean_q,                
+                }
+        if self.im_enable:
+            info["im_reward"] = torch.tensor(self.full_im_reward, dtype=torch.float, device=self.device)
+        if self.cur_enable:
+            info["cur_reward"] = torch.tensor(self.full_im_reward, dtype=torch.float, device=self.device)
         if self.time: self.timings.time("end")
 
-        return ((torch.tensor(model_out, dtype=torch.float32, device=self.device), gym_env_out, model_encodes), 
-                torch.tensor(self.full_reward, dtype=torch.float32, device=self.device), 
-                torch.tensor(self.full_done, dtype=torch.bool, device=self.device), 
+        return (states, 
+                torch.tensor(self.full_reward, dtype=torch.float, device=self.device), 
+                torch.tensor(self.full_done, dtype=torch.float, device=self.device).bool(), 
                 info)
     
-    cdef float[:, :] compute_model_out(self, int[:, :]& action, int[:]& status):
+    cdef float[:, :] compute_tree_reps(self, int[:]& reset, int[:]& status):
         cdef int i
-        cdef int idx1 = self.num_actions*5+5
-        cdef int idx2 = self.num_actions*10+7
-
-        result_np = np.zeros((self.env_n, self.obs_n), dtype=np.float32)
-        cdef float[:, :] result = result_np        
+        cdef int idx1 
+        cdef int idx2 
+        cdef float[:, :] result
+        idx1 = self.num_actions*5+5
+        idx2 = self.num_actions*10+7
+        result = np.zeros((self.env_n, self.obs_n), dtype=np.float32)
         for i in range(self.env_n):
-            result[i, :idx1] = node_stat(self.root_nodes[i], detailed=True, mask_type=self.stat_mask_type)
-            result[i, idx1:idx2] = node_stat(self.cur_nodes[i], detailed=False, mask_type=self.stat_mask_type)    
+            result[i, :idx1] = node_stat(self.root_nodes[i], detailed=True, enc_type=self.enc_type, mask_type=self.stat_mask_type)
+            result[i, idx1:idx2] = node_stat(self.cur_nodes[i], detailed=False, enc_type=self.enc_type, mask_type=self.stat_mask_type)    
             # reset
-            if action is None or status[i] == 1:
+            if reset is None or status[i] == 1:
                 result[i, idx2] = 1.
             else:
-                result[i, idx2] = action[i, 2]
+                result[i, idx2] = reset[i]
             # time
             if self.cur_t[i] < self.rep_rec_t:
                 result[i, idx2+1+self.cur_t[i]] = 1.
             # deprec
             result[i, idx2+self.rep_rec_t+1] = (self.discounting ** (self.rollout_depth[i]))           
         return result
-
-    cdef compute_model_encodes(self, vector[Node*] nodes):
-        model_encodes = []
-        for i in range(self.env_n):
-            encoded = <dict>nodes[i][0].encoded
-            model_encodes.append((encoded["model_ys"] if not nodes[i][0].done 
-                else torch.zeros_like(encoded["model_ys"])).unsqueeze(0))
-        model_encodes = torch.concat(model_encodes)
-        return model_encodes
     
-    cdef compute_model_xs(self, vector[Node*] nodes):
-        xs = []
+    cdef compute_model_out(self, vector[Node*] nodes, key):
+        outs = []
         for i in range(self.env_n):
             encoded = <dict>nodes[i][0].encoded
-            if "pred_xs" not in encoded["model_states"]: return None
-            xs.append((encoded["model_states"]["pred_xs"] if not nodes[i][0].done 
-                else torch.zeros_like(encoded["model_states"]["pred_xs"])).unsqueeze(0))
-        xs = torch.concat(xs)
-        return xs
+            if key not in encoded or encoded[key] is None: 
+                return None
+            outs.append((encoded[key] if not nodes[i][0].done 
+                else torch.zeros_like(encoded[key])).unsqueeze(0))
+        outs = torch.concat(outs)
+        return outs
+
+    cdef prepare_state(self, int[:]& reset, int[:]& status):
+        cdef int i
+
+        tree_reps = self.compute_tree_reps(reset, status)
+        tree_reps = torch.tensor(tree_reps, dtype=torch.float, device=self.device)
+
+        if status is None or np.any(np.array(status)==1):
+            self.real_states = self.compute_model_out(self.root_nodes, "real_states")
+
+        states = {
+            "tree_reps": tree_reps,
+            "real_states": self.real_states,
+        }
+
+        if self.return_x:
+            xs = self.compute_model_out(self.cur_nodes, "xs")
+            if self.return_double and xs is not None:
+                root_xs = self.compute_model_out(self.root_nodes, "xs")
+                xs = torch.concat([root_xs, xs], dim=1)        
+            assert xs is not None, "xs cannot be None"
+            states["xs"] = xs
+
+        if self.return_h:
+            hs = self.compute_model_out(self.cur_nodes, "hs")
+            if self.return_double and hs is not None:
+                root_hs = self.compute_model_out(self.root_nodes, "hs")
+                hs = torch.concat([root_hs, hs], dim=1)
+            assert hs is not None, "hs cannot be None"
+            states["hs"] = hs
+
+        return states
 
     def close(self):
         cdef int i
@@ -711,9 +846,9 @@ cdef class cVecFullModelWrapper():
     def get_action_meanings(self):
         return self.env.get_action_meanings()       
 
-cdef class cVecModelWrapper():
-    """Wrap the gym environment with a model; output for each 
-    step is (out, reward, done, info), where out is a tuple 
+cdef class cPerfectWrapper():
+    """Wrap the gym environment with a perfect model (i.e. env that supports clone_state
+    and restore_state); output for each step is (out, reward, done, info), where out is a tuple 
     of (gym_env_out, model_out, model_encodes) that corresponds to underlying 
     environment frame, output from the model wrapper, and encoding from the model
     Assume a perfect dynamic model.
@@ -722,27 +857,41 @@ cdef class cVecModelWrapper():
     cdef int rec_t
     cdef int rep_rec_t
     cdef float discounting
-    cdef int max_allow_depth
-    cdef bool perfect_model
-    cdef bool tree_carry
-    cdef bool im_enable
-    cdef int actor_see_type
-    cdef bool actor_see_double_encode
+    cdef int max_depth    
+    cdef bool tree_carry    
+
+    cdef int enc_type
     cdef int num_actions
     cdef int obs_n    
     cdef int env_n
-    cdef bool time 
+    
+    cdef bool return_h
+    cdef bool return_x
+    cdef bool return_double
+
+    cdef bool im_enable
+    cdef bool cur_enable
+    cdef float cur_reward_cost
+    cdef float cur_v_cost
+    cdef float cur_enc_cost
+    cdef bool cur_done_gate
+    
     cdef int stat_mask_type
-    cdef bool debug
+    cdef bool time 
+
+    cdef float reward_clip
 
     # python object
     cdef object device
     cdef object env
     cdef object timings
-    cdef readonly baseline_max_q
-    cdef readonly baseline_mean_q    
-    cdef readonly object model_out_shape
-    cdef readonly object gym_env_out_shape
+    cdef object real_states
+    cdef object baseline_mean_q    
+
+    cdef readonly object observation_space
+    cdef readonly object action_space
+    cdef readonly object reward_range
+    cdef readonly object metadata
 
     # tree statistic
     cdef vector[Node*] cur_nodes
@@ -754,68 +903,107 @@ cdef class cVecModelWrapper():
     cdef int[:] cur_t
 
     # internal variables only used in step function
-    cdef float[:] depth_delta
     cdef int[:] max_rollout_depth_
     cdef float[:] mean_q
     cdef float[:] max_q
     cdef int[:] status
     cdef vector[Node*] cur_nodes_
     cdef float[:] par_logits
-    cdef float[:, :] full_reward
+    cdef float[:] full_reward
+    cdef float[:] full_im_reward
+    cdef float[:] full_cur_reward
     cdef bool[:] full_done
     cdef bool[:] full_real_done
     cdef bool[:] full_truncated_done
+    cdef bool[:] full_im_done
+    cdef int[:] step_status
     cdef int[:] total_step
 
-    def __init__(self, env, env_n, flags, device=None, time=False, debug=False):
-        assert flags.perfect_model, "this class only supports perfect model"
-        self.device = torch.device("cpu") if device is None else device
-        self.env = env     
+    def __init__(self, env, env_n, flags, model_net, device=None, time=False):
         if flags.test_rec_t > 0:
             self.rec_t = flags.test_rec_t
             self.rep_rec_t = flags.rec_t         
         else:
-            self.rec_t = flags.rec_t  
-            self.rep_rec_t = flags.rec_t   
+            self.rec_t = flags.rec_t           
+            self.rep_rec_t = flags.rec_t         
         self.discounting = flags.discounting
-        self.max_allow_depth = flags.max_depth
-        self.perfect_model = flags.perfect_model
+        self.max_depth = flags.max_depth
         self.tree_carry = flags.tree_carry
-        self.num_actions = env.action_space[0].n
-        self.im_enable = flags.im_cost > 0.
-        self.actor_see_type = flags.actor_see_type      
-        self.actor_see_double_encode = False
-        self.stat_mask_type = flags.stat_mask_type
-        self.env_n = env_n
-        self.obs_n = 9 + self.num_actions * 10 + self.rep_rec_t
-        self.model_out_shape = (self.obs_n, 1, 1)
-        self.gym_env_out_shape = env.observation_space.shape[1:]
 
-        self.baseline_max_q = torch.zeros(self.env_n, dtype=torch.float32, device=self.device)
-        self.baseline_mean_q = torch.zeros(self.env_n, dtype=torch.float32, device=self.device)        
-        self.time = time
+        self.enc_type = flags.model_enc_type       
+        self.num_actions = env.action_space[0].n
+        self.obs_n = 9 + self.num_actions * 10 + self.rep_rec_t
+        self.env_n = env_n
+
+        self.return_h = flags.return_h  
+        self.return_x = flags.return_x  
+        self.return_double = flags.return_double
+
+        self.im_enable = flags.im_enable
+        self.cur_enable = flags.cur_enable
+        self.cur_reward_cost = flags.cur_reward_cost
+        self.cur_v_cost = flags.cur_v_cost
+        self.cur_enc_cost = flags.cur_enc_cost
+        self.cur_done_gate = flags.cur_done_gate
+        
+        self.stat_mask_type = flags.stat_mask_type
+        self.time = time        
+
+        self.reward_clip = flags.reward_clip
+        
+        self.device = torch.device("cpu") if device is None else device        
+        self.env = env  
         self.timings = util.Timings()
-        self.debug = debug
+        
+        self.observation_space = {
+            "tree_reps": spaces.Box(low=-np.inf, high=np.inf, shape=(self.env_n, self.obs_n), 
+                dtype=np.float32),
+            "real_states": self.env.observation_space,
+        }
+
+        if self.return_x:
+            xs_shape = list(self.env.observation_space.shape)
+            if self.return_double:
+                xs_shape[1] *= 2
+            xs_space = spaces.Box(low=0., high=1., shape=xs_shape, dtype=np.float32)
+            self.observation_space["xs"] = xs_space
+
+        if self.return_h:
+            hs_shape = [env_n,] + list(model_net.hidden_shape)
+            if self.return_double:
+                hs_shape[1] *= 2
+            hs_space = spaces.Box(low=-np.inf, high=np.inf, shape=hs_shape, dtype=np.float32)
+            self.observation_space["hs"] = hs_space
+
+        self.observation_space = spaces.Dict(self.observation_space)
+
+        aug_action_space = spaces.Tuple((spaces.Discrete(self.num_actions),)*self.env_n)
+        reset_space = spaces.Tuple((spaces.Discrete(2),)*self.env_n)
+        self.action_space = spaces.Tuple((aug_action_space, reset_space))
+        self.reward_range = env.reward_range
+        self.metadata = env.metadata
 
         # internal variable init.
-        self.depth_delta = np.zeros(self.env_n, dtype=np.float32)
         self.max_rollout_depth_ = np.zeros(self.env_n, dtype=np.intc)
         self.mean_q =  np.zeros(self.env_n, dtype=np.float32)
         self.max_q = np.zeros(self.env_n, dtype=np.float32)
         self.status = np.zeros(self.env_n, dtype=np.intc)
         self.par_logits = np.zeros(self.num_actions, dtype=np.float32)
-        self.full_reward = np.zeros((self.env_n, 1 + int(self.im_enable)), dtype=np.float32)
-        self.full_done = np.zeros(self.env_n, dtype=np.bool)
-        self.full_real_done = np.zeros(self.env_n, dtype=np.bool)
-        self.full_truncated_done = np.zeros(self.env_n, dtype=np.bool)
+        self.full_reward = np.zeros(self.env_n, dtype=np.float32)
+        self.full_im_reward = np.zeros(self.env_n, dtype=np.float32)
+        self.full_cur_reward = np.zeros(self.env_n, dtype=np.float32)
+        self.full_done = np.zeros(self.env_n, dtype=np.bool_)
+        self.full_real_done = np.zeros(self.env_n, dtype=np.bool_)
+        self.full_truncated_done = np.zeros(self.env_n, dtype=np.bool_)
+        self.full_im_done = np.zeros(self.env_n, dtype=np.bool_)
         self.total_step = np.zeros(self.env_n, dtype=np.intc)
+        self.step_status = np.zeros(self.env_n, dtype=np.intc)
         
     def reset(self, model_net):
         """reset the environment; should only be called in the initial"""
         cdef int i
         cdef Node* root_node
-        cdef Node* cur_node
-        cdef float[:,:] model_out        
+        cdef Node* cur_node      
 
         with torch.no_grad():
             # some init.
@@ -824,6 +1012,7 @@ cdef class cVecModelWrapper():
             self.rollout_depth = np.zeros(self.env_n, dtype=np.intc)
             self.max_rollout_depth = np.zeros(self.env_n, dtype=np.intc)
             self.cur_t = np.zeros(self.env_n, dtype=np.intc)
+            self.baseline_mean_q = torch.zeros(self.env_n, dtype=torch.float, device=self.device)        
 
             # reset obs
             obs = self.env.reset()
@@ -833,7 +1022,10 @@ cdef class cVecModelWrapper():
             pass_action = torch.zeros(self.env_n, dtype=torch.long)
             model_net_out = model_net(obs_py, 
                                       pass_action.unsqueeze(0).to(self.device), 
-                                      one_hot=False)  
+                                      one_hot=False,
+                                      ret_xs=self.return_x,
+                                      ret_zs=False,
+                                      ret_hs=self.return_h)  
             vs = model_net_out.vs.cpu()
             logits = model_net_out.logits.cpu()
             env_state = self.env.clone_state(inds=np.arange(self.env_n))
@@ -842,43 +1034,25 @@ cdef class cVecModelWrapper():
             for i in range(self.env_n):
                 root_node = node_new(pparent=NULL, action=pass_action[i].item(), logit=0., num_actions=self.num_actions, 
                     discounting=self.discounting, rec_t=self.rec_t, remember_path=False)                
-                if self.actor_see_type <= 0:
-                    encoded = {"env_state": env_state[i], "gym_env_out": obs_py[i]}
-                else:
-                    encoded = {"env_state": env_state[i], 
-                               "gym_env_out": obs_py[i], 
-                               "model_ys": model_net_out.ys[-1,i]}
+                encoded = {"real_states": obs_py[i],
+                           "xs": model_net_out.xs[-1, i] if model_net_out.xs is not None else None,
+                           "hs": model_net_out.hs[-1, i] if model_net_out.hs is not None else None,
+                           "env_states": env_state[i],
+                           }
                 node_expand(pnode=root_node, r=0., v=vs[-1, i].item(), t=self.total_step[i], done=False,
                     logits=logits[-1, i].numpy(), encoded=<PyObject*>encoded, override=False)
                 node_visit(pnode=root_node)
                 self.root_nodes.push_back(root_node)
                 self.cur_nodes.push_back(root_node)
             
-            # compute model_out
-            model_out = self.compute_model_out(None, None)
-
-            gym_env_out = []
-            for i in range(self.env_n):
-                encoded = <dict>self.cur_nodes[i][0].encoded
-                gym_env_out.append(encoded["gym_env_out"].unsqueeze(0))
-            gym_env_out = torch.concat(gym_env_out)
-
-            if not self.actor_see_type == 0:
-                model_encodes = self.compute_model_encodes(self.cur_nodes)
-                if self.actor_see_double_encode:
-                    model_encodes = torch.concat([model_encodes, model_encodes], dim=1)
-            else:
-                model_encodes = None
-
             # record initial root_nodes_qmax 
             for i in range(self.env_n):
                 self.root_nodes_qmax[i] = self.root_nodes[i][0].max_q
-            
-            return torch.tensor(model_out, dtype=torch.float32, device=self.device), gym_env_out, model_encodes
+
+            states = self.prepare_state(None, None)            
+            return states
 
     def step(self, action, model_net):  
-        # action is tensor of shape (env_n, 3)
-        # which corresponds to real_action, im_action, reset, term
 
         cdef int i, j, k
         cdef int[:] re_action
@@ -889,8 +1063,7 @@ cdef class cVecModelWrapper():
         cdef Node* cur_node
         cdef Node* next_node
         cdef vector[Node*] cur_nodes_
-        cdef vector[Node*] root_nodes_    
-        cdef float[:,:] model_out        
+        cdef vector[Node*] root_nodes_          
 
         cdef vector[int] pass_inds_restore
         cdef vector[int] pass_inds_step
@@ -901,16 +1074,39 @@ cdef class cVecModelWrapper():
         cdef float[:] vs
         cdef float[:,:] logits
 
-        if self.time: self.timings.reset()
-        action = action.cpu().int().numpy()
-        re_action, im_action, reset = action[:, 0], action[:, 1], action[:, 2]
+        if self.time: self.timings.reset()        
+
+        assert type(action) is tuple and len(action) == 2, \
+            "action should be a tuple of size 2, containing augmented action and reset"        
+        for i in range(len(action)):
+            a = action[i]            
+            assert torch.is_tensor(a) or \
+                isinstance(a, np.ndarray) or \
+                isinstance(a, list), \
+                f"action[{i}] should be either torch.tensor or np.ndarray or list"            
+            if torch.is_tensor(a):
+                a = a.detach().cpu().numpy()
+            if isinstance(a, list):
+                a = np.array(a, dtype=np.int32)
+            assert a.shape == (self.env_n,), \
+                f"action[{i}] shape should be {(self.env_n,)}, not {a.shape}"
+            if a.dtype != np.int32:
+                a = a.astype(np.int32)
+            if i == 0:
+                re_action = a
+                im_action = a
+                assert (a >= 0).all() and (a < self.num_actions).all(), \
+                    f"primiary action should be in [0, {self.num_actions-1}], not {a}"
+            else:
+                reset = a       
+                assert (a >= 0).all() and (a < 2).all(), \
+                    f"reset action should be in [0, 1], not {a}"  
 
         pass_env_states = []
 
         for i in range(self.env_n):            
             # compute the mask of real / imagination step                             
             self.max_rollout_depth_[i] = self.max_rollout_depth[i]
-            self.depth_delta[i] = 1.
             if self.cur_t[i] < self.rec_t - 1: # imagaination step
                 self.cur_t[i] += 1
                 self.rollout_depth[i] += 1
@@ -923,7 +1119,7 @@ cdef class cVecModelWrapper():
                 else:
                     if self.status[i] != 0 or self.status[i] != 4: # no need restore if last step is real or just expanded
                         encoded = <dict> self.cur_nodes[i][0].encoded
-                        pass_env_states.append(encoded["env_state"])
+                        pass_env_states.append(encoded["env_states"])
                         pass_inds_restore.push_back(i)
                         pass_action.push_back(im_action[i])
                         pass_inds_step.push_back(i)
@@ -934,10 +1130,9 @@ cdef class cVecModelWrapper():
                 self.max_rollout_depth[i] = 0
                 self.total_step[i] = self.total_step[i] + 1
                 # record baseline before moving on
-                self.baseline_mean_q[i] = average(self.root_nodes[i][0].prollout_qs[0]) / self.discounting
-                self.baseline_max_q[i] = maximum(self.root_nodes[i][0].prollout_qs[0]) / self.discounting
+                self.baseline_mean_q[i] = average(self.root_nodes[i][0].prollout_qs[0]) / self.discounting                
                 encoded = <dict> self.root_nodes[i][0].encoded
-                pass_env_states.append(encoded["env_state"])
+                pass_env_states.append(encoded["env_states"])
                 pass_inds_restore.push_back(i)
                 pass_action.push_back(re_action[i])
                 pass_inds_step.push_back(i)
@@ -972,15 +1167,18 @@ cdef class cVecModelWrapper():
         if pass_inds_step.size() > 0:
             with torch.no_grad():
                 obs_py = torch.tensor(obs, dtype=torch.uint8, device=self.device)
+                pass_action_py = torch.tensor(pass_action, dtype=long, device=self.device).unsqueeze(0)
                 model_net_out = model_net(obs_py, 
-                        torch.tensor(pass_action, dtype=long, device=self.device).unsqueeze(0), 
-                        one_hot=False)  
-                model_ys = model_net_out.ys
+                                          pass_action_py, 
+                                          one_hot=False,
+                                          ret_xs=self.return_x,
+                                          ret_zs=False,
+                                          ret_hs=self.return_h)  
             vs = model_net_out.vs[-1].float().cpu().numpy()
             logits = model_net_out.logits[-1].float().cpu().numpy()
             if self.time: self.timings.time("model")
             env_state = self.env.clone_state(inds=pass_inds_step)   
-            if self.time: self.timings.time("clone_state")
+            if self.time: self.timings.time("clone_state")        
 
         # compute the current and root nodes
         j = 0
@@ -991,26 +1189,18 @@ cdef class cVecModelWrapper():
                     not node_expanded(self.root_nodes[i][0].ppchildren[0][re_action[i]], -1) or done[j])
                 if new_root:
                     root_node = node_new(pparent=NULL, action=pass_action[j], logit=0., num_actions=self.num_actions, 
-                        discounting=self.discounting, rec_t=self.rec_t, remember_path=False)
-                    if self.actor_see_type <= 0:
-                        encoded = {"env_state": env_state[j], "gym_env_out": obs_py[j]}
-                    else:
-                        encoded = {"env_state": env_state[j], "gym_env_out": obs_py[j], "model_ys": model_ys[-1,j]}
-                    node_expand(pnode=root_node, r=0., v=vs[j], t=self.total_step[i], done=False,
-                        logits=logits[j], encoded=<PyObject*>encoded, override=False)
-                    node_del(self.root_nodes[i], except_idx=-1)
-                    node_visit(root_node)
+                        discounting=self.discounting, rec_t=self.rec_t, remember_path=True)
                 else:
                     root_node = self.root_nodes[i][0].ppchildren[0][re_action[i]]
-                    if self.actor_see_type <= 0:
-                        encoded = {"env_state": env_state[j], "gym_env_out": obs_py[j]}
-                    else:
-                        encoded = {"env_state": env_state[j], "gym_env_out": obs_py[j], "model_ys": model_ys[-1,j]}
-                    node_expand(pnode=root_node, r=0., v=vs[j], t=self.total_step[i], done=False,
-                        logits=logits[j], encoded=<PyObject*>encoded, override=True)                        
-                    node_del(self.root_nodes[i], except_idx=re_action[i])
-                    node_visit(root_node)
-                    
+                encoded = {"real_states": obs_py[j],
+                            "xs": model_net_out.xs[-1, j] if model_net_out.xs is not None else None,
+                            "hs": model_net_out.hs[-1, j] if model_net_out.hs is not None else None,
+                            "env_states": env_state[j],}
+                node_expand(pnode=root_node, r=0., v=vs[j], t=self.total_step[i], done=False,
+                    logits=logits[j], encoded=<PyObject*>encoded, override=not new_root)
+                except_idx = -1 if new_root else re_action[i]
+                node_del(self.root_nodes[i], except_idx=except_idx)
+                node_visit(root_node)                    
                 j += 1
                 root_nodes_.push_back(root_node)
                 cur_nodes_.push_back(root_node)
@@ -1035,12 +1225,17 @@ cdef class cVecModelWrapper():
             
             elif self.status[i] == 4:
                 # need expand
-                if self.actor_see_type <= 0:
-                    encoded = {"env_state": env_state[j], "gym_env_out": obs_py[j]}
-                else:
-                    encoded = {"env_state": env_state[j], "gym_env_out": obs_py[j], "model_ys": model_ys[-1,j]}
+                encoded = {"real_states": None,
+                            "xs": model_net_out.xs[-1, j] if model_net_out.xs is not None else None,
+                            "hs": model_net_out.hs[-1, j] if model_net_out.hs is not None else None,
+                            "env_states": env_state[j],
+                            }
                 cur_node = self.cur_nodes[i][0].ppchildren[0][im_action[i]]
-                node_expand(pnode=cur_node, r=reward[j], v=vs[j] if not done[j] else 0., t=self.total_step[i], done=done[j],
+                if self.reward_clip > 0.: 
+                    r = np.clip(reward[j], -self.reward_clip, +self.reward_clip)
+                else:
+                    r = reward[j]
+                node_expand(pnode=cur_node, r=r, v=vs[j] if not done[j] else 0., t=self.total_step[i], done=done[j],
                         logits=logits[j], encoded=<PyObject*>encoded, override=False)
                 node_visit(cur_node)
                 root_nodes_.push_back(self.root_nodes[i])
@@ -1052,85 +1247,84 @@ cdef class cVecModelWrapper():
         if self.time: self.timings.time("compute_root_cur_nodes")
 
         # reset if serach depth exceeds max depth
-        if self.max_allow_depth > 0:
+        if self.max_depth > 0:
             for i in range(self.env_n):
-                if self.rollout_depth[i] >= self.max_allow_depth:
-                    action[i, 2] = 1
+                if self.rollout_depth[i] >= self.max_depth:
                     reset[i] = 1
 
-        # compute model_out        
-        model_out = self.compute_model_out(action, self.status)
-
-        gym_env_out = []
-        for i in range(self.env_n):
-            encoded = <dict>self.cur_nodes[i][0].encoded
-            gym_env_out.append(encoded["gym_env_out"].unsqueeze(0))
-        gym_env_out = torch.concat(gym_env_out)
-
-        if self.actor_see_type > 0:
-            model_encodes = self.compute_model_encodes(self.cur_nodes)
-            if self.actor_see_double_encode:
-                model_encodes_ = self.compute_model_encodes(self.root_nodes)
-                model_encodes = torch.concat([model_encodes, model_encodes_], dim=1)
-        else:
-            model_encodes = None
-
-        if self.time: self.timings.time("compute_model_out")
-
+        # compute states        
+        states = self.prepare_state(reset, self.status)
+        if self.time: self.timings.time("compute_state")
+        
         # compute reward
         j = 0
         for i in range(self.env_n):
             if self.status[i] == 1:
-                self.full_reward[i][0] = reward[j]
+                self.full_reward[i] = reward[j]
             else:
-                self.full_reward[i][0] = 0.
+                self.full_reward[i] = 0.
             if self.im_enable:                        
                 self.root_nodes_qmax_[i] = self.root_nodes[i][0].max_q
                 if self.status[i] != 1:                
-                    self.full_reward[i][1] = (self.root_nodes_qmax_[i] - self.root_nodes_qmax[i])*self.depth_delta[i]
+                    self.full_im_reward[i] = (self.root_nodes_qmax_[i] - self.root_nodes_qmax[i])
                 else:
-                    self.full_reward[i][1] = 0.
+                    self.full_im_reward[i] = 0.
                 self.root_nodes_qmax[i] = self.root_nodes_qmax_[i]
             if self.status[i] == 1 or self.status[i] == 4:
                 j += 1
         if self.time: self.timings.time("compute_reward")
-
-        # compute done & full_real_done
+        
         j = 0
         for i in range(self.env_n):
+            # compute done & full_real_done
             if self.status[i] == 1:
                 self.full_done[i] = done[j]
                 self.full_real_done[i] = real_done[j]
                 self.full_truncated_done[i] = truncated_done[j]
+                self.full_im_done[i] = False
             else:
                 self.full_done[i] = False
                 self.full_real_done[i] = False
                 self.full_truncated_done[i] = False
+                self.full_im_done[i] = self.cur_nodes[i][0].done
             if self.status[i] == 1 or self.status[i] == 4:
                 j += 1
 
-        # compute reset
-        for i in range(self.env_n):
+            # compute reset
             if reset[i]:
                 self.rollout_depth[i] = 0
                 self.cur_nodes[i] = self.root_nodes[i]
                 node_visit(self.cur_nodes[i])
                 self.status[i] = 5 # need to restore state on the next transition, so we need to alter the status from 4
+
+            if self.cur_t[i] == 0:
+                self.step_status[i] = 0 # real action just taken
+            elif self.cur_t[i] < self.rec_t - 1:
+                self.step_status[i] = 1 # im action just taken
+            elif self.cur_t[i] >= self.rec_t - 1:
+                self.step_status[i] = 2 # im action just taken; next action is real action
         
         # some extra info
-        info = {"cur_t": torch.tensor(self.cur_t, dtype=torch.long, device=self.device),
+        info = {
+                "real_done": torch.tensor(self.full_real_done, dtype=torch.float, device=self.device).bool(),
+                "truncated_done": torch.tensor(self.full_truncated_done, dtype=torch.float, device=self.device).bool(),
+                #"im_done": torch.tensor(self.full_im_done, dtype=torch.float, device=self.device).bool(),
+                "step_status": torch.tensor(self.step_status, device=self.device),
                 "max_rollout_depth":  torch.tensor(self.max_rollout_depth_, dtype=torch.long, device=self.device),
-                "real_done": torch.tensor(self.full_real_done, dtype=torch.bool, device=self.device),
-                "truncated_done": torch.tensor(self.full_truncated_done, dtype=torch.bool, device=self.device)}
+                "baseline": self.baseline_mean_q,
+                }
+        if self.im_enable:
+            info["im_reward"] = torch.tensor(self.full_im_reward, dtype=torch.float, device=self.device)
+        if self.cur_enable:
+            info["cur_reward"] = torch.tensor(self.full_im_reward, dtype=torch.float, device=self.device)
         if self.time: self.timings.time("end")
 
-        return ((torch.tensor(model_out, dtype=torch.float32, device=self.device), gym_env_out, model_encodes), 
-                torch.tensor(self.full_reward, dtype=torch.float32, device=self.device), 
-                torch.tensor(self.full_done, dtype=torch.bool, device=self.device), 
+        return (states, 
+                torch.tensor(self.full_reward, dtype=torch.float, device=self.device), 
+                torch.tensor(self.full_done, dtype=torch.float, device=self.device).bool(), 
                 info)
-
     
-    cdef float[:, :] compute_model_out(self, int[:, :]& action, int[:]& status):
+    cdef float[:, :] compute_tree_reps(self, int[:]& reset, int[:]& status):
         cdef int i
         cdef int idx1 = self.num_actions*5+5
         cdef int idx2 = self.num_actions*10+7
@@ -1138,27 +1332,62 @@ cdef class cVecModelWrapper():
         result_np = np.zeros((self.env_n, self.obs_n), dtype=np.float32)
         cdef float[:, :] result = result_np        
         for i in range(self.env_n):
-            result[i, :idx1] = node_stat(self.root_nodes[i], detailed=True, mask_type=self.stat_mask_type)
-            result[i, idx1:idx2] = node_stat(self.cur_nodes[i], detailed=False, mask_type=self.stat_mask_type)    
+            result[i, :idx1] = node_stat(self.root_nodes[i], detailed=True, enc_type=self.enc_type, mask_type=self.stat_mask_type)
+            result[i, idx1:idx2] = node_stat(self.cur_nodes[i], detailed=False, enc_type=self.enc_type, mask_type=self.stat_mask_type)    
             # reset
-            if action is None or status[i] == 1:
+            if reset is None or status[i] == 1:
                 result[i, idx2] = 1.
             else:
-                result[i, idx2] = action[i, 2]
+                result[i, idx2] = reset[i]
             # time
             if self.cur_t[i] < self.rep_rec_t:
                 result[i, idx2+1+self.cur_t[i]] = 1.
             # deprec
-            result[i, idx2+self.rec_t+1] = (self.discounting ** (self.rollout_depth[i]))           
+            result[i, idx2+self.rep_rec_t+1] = (self.discounting ** (self.rollout_depth[i]))           
         return result
 
-    cdef compute_model_encodes(self, vector[Node*] nodes):
-        model_encodes = []
+    cdef compute_model_out(self, vector[Node*] nodes, key):
+        outs = []
         for i in range(self.env_n):
             encoded = <dict>nodes[i][0].encoded
-            model_encodes.append(encoded["model_ys"].unsqueeze(0))
-        model_encodes = torch.concat(model_encodes)
-        return model_encodes
+            if key not in encoded or encoded[key] is None: 
+                return None
+            outs.append((encoded[key] if not nodes[i][0].done 
+                else torch.zeros_like(encoded[key])).unsqueeze(0))
+        outs = torch.concat(outs)
+        return outs
+
+    cdef prepare_state(self, int[:]& reset, int[:]& status):
+        cdef int i
+
+        tree_reps = self.compute_tree_reps(reset, status)
+        tree_reps = torch.tensor(tree_reps, dtype=torch.float, device=self.device)
+
+        if status is None or np.any(np.array(status)!=1):
+            self.real_states = self.compute_model_out(self.root_nodes, "real_states")
+
+        states = {
+            "tree_reps": tree_reps,
+            "real_states": self.real_states,
+        }
+
+        if self.return_x:
+            xs = self.compute_model_out(self.cur_nodes, "xs")
+            if self.return_double and xs is not None:
+                root_xs = self.compute_model_out(self.root_nodes, "xs")
+                xs = torch.concat([root_xs, xs], dim=1)        
+            assert xs is not None, "xs cannot be None"
+            states["xs"] = xs
+
+        if self.return_h:
+            hs = self.compute_model_out(self.cur_nodes, "hs")
+            if self.return_double and hs is not None:
+                root_hs = self.compute_model_out(self.root_nodes, "hs")
+                hs = torch.concat([root_hs, hs], dim=1)
+            assert hs is not None, "hs cannot be None"
+            states["hs"] = hs
+
+        return states
 
     def close(self):
         cdef int i

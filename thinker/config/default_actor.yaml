@@ -1,0 +1,70 @@
+# the setting in this yaml will override default_thinker (for actor-critic run)
+# env
+name: "Sokoban-v0" # name of the environment
+# env override setting
+require_prob: true # whether to use prob to train model instead of sampled action
+parallel: true # whether to use a parallel ray actor for training the model
+discounting: 0.97 # discount rate of the raw MDP
+reward_clip: -1.0 # reward clipping; if positve, the reward is clipped within the absolute value of this values
+# training setting
+train_actor: true # whether to train actor
+total_steps: 50000000 # total number of real steps to train
+actor_learning_rate: 0.0006 # actor learning rate
+actor_batch_size: 16 # actor batch size
+actor_unroll_len: 201 # unroll length used to update actor
+actor_use_rms: false # whether to use rms (default: adam) as optimizer
+actor_grad_norm_clipping: 1200 # gradient clipping norm; non-positive for no clipping
+actor_adam_eps: 0.00000001 # eps for Adam optimizer
+return_norm_type: -1 # return norm type; -1 for no normalization, 0 for value normalization, 1 for advantage normalization
+# cost setting
+im_cost: 1. # cost for imaginary rewards
+im_cost_anneal: true # whether to anneal the imaginary cost to 0
+cur_cost: 0. # cost for curiosity rewards
+cur_cost_anneal: true # whether to anneal the curiosity cost to 0
+baseline_cost: 0.5 # cost for computing baseline
+entropy_cost: 0.001 # entropy cost for real actions
+im_entropy_cost: 0.0001 # entropy cost for imaginary actions
+reg_cost: 0.001 # regularization cost
+xss_cost: 0. # self-supervised loss for the real state branch
+# actor setting
+see_real_state: false # whether to see root real state
+see_tree_rep: true # whether to see tree representation
+see_h: true # whether to see model's hidden state
+see_x: false # whether to see the model's predicted state
+# actor network setting
+drc: false # whether to use the drc baseline
+tree_rep_rnn: true # whether to use rnn in processing tree representation
+x_rnn: false # whether to use rnn in processing x, model's predicted state
+tran_t: 1 # internal transition step for rnn
+tran_mem_n: 40 # memory slot size for the attention module in lstm-attn
+tran_layer_n: 3 # number of layers of lstm-attn
+tran_lstm_no_attn: false # whether to disable the attention module in lstm-attn
+tran_attn_b: 5 # initial bias for attending to the current step
+tran_dim: 128 # hidden dimension of lstm-attn
+disable_mem: false # whether to erasing rnn's hidden state on each step
+critic_zero_init: true # whether to zero initialize the critic outputs
+critic_enc_type: 0 # reward / value encoding type for the critic; 0 for no encoding, 1 for scalar encoding, 2 for unbiased vector encoding, 3 for biased vector encoding
+sep_im_head: true # whether to use seperate head for computing imaginary logit
+# checkpoint
+xpid: '' # name of the run, automatically set if not given
+ckp: false # whether to load checkpoint; if set to true, will load checkpoint from savedir/xpid
+preload_actor: '' # path for the folder that consists ckp_actor.tar, which is used to initialize  actor
+savedir: '../logs/__project__' # base log directory
+use_wandb: false # whether to use wandb; need to have global variable WANDB_USER set to wandb user
+wandb_ckp_freq: 500000 # frequency in real steps to upload all files in the run
+policy_vis_freq: 2000000 # frequency in real steps to visualize the run
+policy_vis_length: 20 # length of the video visualization
+# misc
+profile: false # whether to output all the time statistics of the run
+parallel_actor: true # whether to use a parallel ray actor for training the actor
+# ray resources
+auto_res: true # whether to auto allocate gpu
+ray_mem: -1 # default initialized ray memory
+ray_gpu: -1 # number of initial gpu (set to -1 for auto detect)
+ray_cpu: -1 # number of initial cpu (set to -1 for auto detect)
+self_play_n: 1 # number of self-play ray actors (will be set automatically if auto_res is enabled)
+env_n: 16 # number of parallel environment for each self-play ray actors
+gpu_self_play: 0.25 # gpu for each self-play ray actor (will be set automatically if auto_res is enabled)
+gpu_learn_actor: 0.25 # gpu for the actor-learning ray actor (will be set automatically if auto_res is enabled)
+gpu_learn: 0.5 # gpu for the model-learning ray actor (will be set automatically if auto_res is enabled)
+

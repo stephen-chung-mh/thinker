@@ -1,89 +1,131 @@
-from collections import namedtuple, deque
+from collections import deque
 import numpy as np
 import cv2
-import time
 import torch
-from torch.nn import functional as F
 import gym
-from thinker.gym_add.asyn_vector_env import AsyncVectorEnv
-from thinker.cenv import cVecModelWrapper, cVecFullModelWrapper
-from thinker import util
+from gym import spaces
 
-EnvOut = namedtuple(
-    "EnvOut",
-    [
-        "gym_env_out",
-        "model_out",
-        "model_encodes",
-        "reward",
-        "done",
-        "real_done",
-        "truncated_done",
-        "episode_return",
-        "episode_step",
-        "cur_t",
-        "last_action",
-        "max_rollout_depth",
-    ],
-)
-
-
-def Environment(
-    flags,
-    model_wrap=True,
-    env_n=1,
-    device=None,
-    time=False,
-    debug=False,
-    debug_done=False,
-):
-    """Create an environment using flags.env; first
-    wrap the env with basic wrapper, then wrap it
-    with a model, and finally wrap it with PosWrapper
-    for episode processing
-
-    Args:
-        flags (namespace): configuration flags
-        model_wrap (boolean): whether to wrap the environment with model
-        env_n (int): number of parallel env
-        device (torch.device): device that runs the model
-    Return:
-        environment
+class DummyWrapper(gym.Wrapper):
+    """DummyWrapper that represents the core wrapper for the real env;
+    the only function is to convert returning var into tensor
+    and reset the env when it is done.
     """
-    if flags.env == "Sokoban-v0":
-        import gym_sokoban
-    if "cSokoban" in flags.env:
-        import gym_csokoban
+    def __init__(self, env, env_n, flags, model_net, device=None, time=False):   
+        gym.Wrapper.__init__(self, env)
+        self.env_n = env_n
+        self.flags = flags
+        self.device = torch.device("cpu") if device is None else device 
+        self.observation_space = spaces.Dict({
+            "real_states": self.env.observation_space,
+        })        
+        self.norm_low = self.env.observation_space.low[0]
+        self.norm_high = self.env.observation_space.high[0]
 
-    env = AsyncVectorEnv(
-        [lambda: PreWrap(gym.make(flags.env), flags, debug_done) for _ in range(env_n)]
-    )
-    num_actions = env.action_space[0].n
-    if model_wrap:
-        wrapper = cVecModelWrapper if flags.perfect_model else cVecFullModelWrapper
-        env = PostVecModelWrapper(
-            wrapper(env, env_n, flags, device=device, time=time, debug=debug),
-            env_n,
-            num_actions,
-            flags,
-            model_wrap=True,
-            device=device,
+    def reset(self, model_net):
+        obs = self.env.reset()
+        obs_py = torch.tensor(obs, dtype=torch.uint8, device=self.device)
+        states = {"real_states": obs_py,
+                  }       
+        if self.flags.return_x:
+            with torch.set_grad_enabled(False):
+                states["xs"] = (obs_py.float() - self.norm_low) / \
+                            (self.norm_high -  self.norm_low)
+        return states 
+
+    def step(self, action, model_net):  
+        # action in shape (B, *) or (B,)
+        if len(action.shape) > 1:
+            action = action[:, 0]
+        if torch.is_tensor(action):
+            action = action.detach().cpu().numpy()
+
+        obs, reward, done, info = self.env.step(action) 
+        if np.any(done):
+            done_idx = np.arange(self.env_n)[done]
+            obs_reset = self.env.reset(done_idx)
+            
+        real_done = [m["real_done"] if "real_done" in m else done[n] for n, m in enumerate(info)]
+        truncated_done = [m["truncated_done"] if "truncated_done" in m else False for n, m in enumerate(info)]
+        obs_py = torch.tensor(obs, dtype=torch.uint8, device=self.device)
+        if np.any(done):
+            obs_py[done] = torch.tensor(obs_reset, dtype=torch.uint8, device=self.device)
+
+        states = {
+            "real_states": obs_py,
+        }     
+  
+        info = {"real_done": torch.tensor(real_done, dtype=torch.bool, device=self.device),
+                "truncated_done": torch.tensor(truncated_done, dtype=torch.bool, device=self.device),                
+                "step_status": torch.zeros(self.env_n, dtype=torch.long, device=self.device),
+                }
+        if self.flags.return_x:
+            with torch.set_grad_enabled(False):
+                states["xs"] = (obs_py.float() - self.norm_low) / \
+                            (self.norm_high -  self.norm_low)
+        
+        return (states, 
+                torch.tensor(reward, dtype=torch.float32, device=self.device), 
+                torch.tensor(done, dtype=torch.bool, device=self.device), 
+                info)
+    
+    def unnormalize(self, x):
+        assert x.dtype == torch.float or x.dtype == torch.float32
+        ch = x.shape[-3]
+        x = torch.clamp(x, 0, 1)
+        x = x * (self.norm_high[-ch:] -  self.norm_low[-ch:]) + self.norm_low[-ch:]
+        return x
+    
+class PostWrapper(gym.Wrapper):
+    """Wrapper for recording episode return, clipping rewards"""
+    def __init__(self, env, reward_clip):
+        gym.Wrapper.__init__(self, env)
+        self.reset_called = False
+        self.reward_clip = reward_clip
+    
+    def reset(self, model_net):
+        state = self.env.reset(model_net)
+        self.device = state["real_states"].device
+        self.env_n = state["real_states"].shape[0]
+
+        self.episode_step = torch.zeros(
+            self.env_n, dtype=torch.long, device=self.device
         )
-    else:
-        env = PostVecModelWrapper(
-            env, env_n, num_actions, flags, model_wrap=False, device=device
-        )
-    return env
 
+        self.episode_return = {}
+        for key in ["re", "im", "cur"]:
+            self.episode_return[key] = torch.zeros(
+                self.env_n, dtype=torch.float, device=self.device
+            )
+        self.reset_called = True
+        return state
 
-def PreWrap(env, flags, debug_done=False):
-    name = flags.env
-    if "cSokoban" in name:
-        env = TransposeWrap(env)
-    elif name == "Sokoban-v0":
-        env = NoopWrapper(env, cost=-0.01)
-        env = WarpFrame(env, width=80, height=80, grayscale=flags.grayscale)
-        env = TimeLimit_(env, max_episode_steps=120)
+    def step(self, action, model_net):
+        assert self.reset_called, "need to call reset ONCE before step"
+        state, reward, done, info = self.env.step(action, model_net)
+        real_done = info["real_done"]
+
+        self.episode_step += 1
+        info["episode_step"] = self.episode_step.clone()
+        self.episode_step[real_done] = 0
+
+        self.episode_return["re"] += reward
+        info["episode_return"] = self.episode_return["re"].clone()
+        self.episode_return["re"][real_done] = 0.
+
+        for prefix in ["im", "cur"]:
+            if prefix+"_reward" in info:
+                self.episode_return[prefix] += info[prefix+"_reward"]
+                info[prefix + "_episode_return"] = self.episode_return[prefix].clone()
+                self.episode_return[prefix][real_done] = 0.
+                if prefix == "im":
+                    self.episode_return[prefix][info["step_status"] == 0] = 0.
+        
+        if self.reward_clip > 0.:
+            reward = torch.clamp(reward, -self.reward_clip, +self.reward_clip)
+        return state, reward, done, info
+
+def PreWrapper(env, name, grayscale=False, frame_wh=96):
+    if "Sokoban" in name:
         env = TransposeWrap(env)
     else:
         env = StateWrapper(env)
@@ -97,193 +139,13 @@ def PreWrap(env, flags, debug_done=False):
             clip_rewards=False,
             frame_stack=True,
             scale=False,
-            grayscale=flags.grayscale,
-            frame_wh=flags.frame_wh,
+            grayscale=grayscale,
+            frame_wh=frame_wh,
         )
         env = TransposeWrap(env)
-    if debug_done:
-        env = DoneEnv(env)
     return env
 
-
-class PostVecModelWrapper(gym.Wrapper):
-    """The final wrapper for env.; calculates episode return,
-    record last action, and returns EnvOut"""
-
-    def __init__(self, env, env_n, num_actions, flags, model_wrap=True, device=None):
-        self.device = torch.device("cpu") if device is None else device
-        self.env = env
-        self.env_n = env_n
-        self.num_actions = num_actions
-        self.flags = flags
-        self.model_wrap = model_wrap
-        self.model_out_shape = env.model_out_shape if self.model_wrap else None
-        self.gym_env_out_shape = (
-            env.gym_env_out_shape
-            if self.model_wrap
-            else env.observation_space.shape[1:]
-        )
-
-    def initial(self, model_net=None):
-        if self.model_wrap:
-            reward_shape = (
-                1 + int(self.flags.im_cost > 0.0) 
-            )
-            action_shape = 3
-        else:
-            reward_shape = 1
-            action_shape = 1
-        self.last_action = torch.zeros(
-            self.env_n, action_shape, dtype=torch.long, device=self.device
-        )
-        self.episode_return = torch.zeros(
-            1, self.env_n, reward_shape, dtype=torch.float32, device=self.device
-        )
-        self.episode_step = torch.zeros(
-            1, self.env_n, dtype=torch.long, device=self.device
-        )
-
-        if self.model_wrap:
-            model_out, gym_env_out, model_encodes = self.env.reset(model_net)
-            model_out = model_out.unsqueeze(0)
-        else:
-            gym_env_out = torch.tensor(
-                self.env.reset(model_net), dtype=torch.uint8, device=self.device
-            )
-            model_out = None
-            model_encodes = None
-
-        gym_env_out = gym_env_out.unsqueeze(0)
-        if model_encodes is not None:
-            model_encodes = model_encodes.unsqueeze(0)
-
-        ret = EnvOut(
-            gym_env_out=gym_env_out,
-            model_out=model_out,
-            model_encodes=model_encodes,
-            reward=torch.zeros(
-                1, self.env_n, reward_shape, dtype=torch.float32, device=self.device
-            ),
-            done=torch.ones(1, self.env_n, dtype=torch.bool, device=self.device),
-            real_done=torch.ones(1, self.env_n, dtype=torch.bool, device=self.device),
-            truncated_done=torch.ones(
-                1, self.env_n, dtype=torch.bool, device=self.device
-            ),
-            episode_return=self.episode_return,
-            episode_step=self.episode_step,
-            cur_t=torch.zeros(1, self.env_n, dtype=torch.long, device=self.device)
-            if self.model_wrap
-            else None,
-            last_action=self.last_action.unsqueeze(0),
-            max_rollout_depth=torch.zeros(
-                1, self.env_n, dtype=torch.long, device=self.device
-            )
-            if self.model_wrap
-            else None,
-        )
-        return ret
-
-    def step(self, action, model_net=None):
-        action_shape = 3 if self.model_wrap else 1
-        assert action.shape == (1, self.env_n, action_shape), (
-            "shape of action should be (1, B, %d)" % action_shape
-        )
-
-        if not self.model_wrap:
-            action = action[:, :, 0].cpu()
-        out, reward, done, info = self.env.step(action[0], model_net)
-        if self.model_wrap:
-            real_done = info["real_done"]
-            truncated_done = info["truncated_done"]
-        else:
-            real_done = [
-                d["real_done"] if "real_done" in d else done[n]
-                for n, d in enumerate(info)
-            ]
-            truncated_done = [
-                d["truncated_done"] if "truncated_done" in d else False for d in info
-            ]
-
-        if self.model_wrap:
-            model_out, gym_env_out, model_encodes = out
-            model_out = model_out.unsqueeze(0)
-        else:
-            gym_env_out = torch.tensor(out, dtype=torch.uint8, device=self.device)
-
-            if np.any(done):
-                done_idx = np.arange(self.env_n)[done]
-                out_ = self.env.reset(done_idx)
-                gym_env_out[done] = torch.tensor(
-                    out_, dtype=torch.uint8, device=self.device
-                )
-
-            model_out = None
-            model_encodes = None
-            reward = torch.tensor(
-                reward, dtype=torch.float32, device=self.device
-            ).unsqueeze(-1)
-            done = torch.tensor(done, dtype=torch.bool, device=self.device)
-            real_done = torch.tensor(real_done, dtype=torch.bool, device=self.device)
-            truncated_done = torch.tensor(
-                truncated_done, dtype=torch.bool, device=self.device
-            )
-
-        if gym_env_out is not None:
-            gym_env_out = gym_env_out.unsqueeze(0)
-        if model_encodes is not None:
-            model_encodes = model_encodes.unsqueeze(0)
-
-        self.episode_step += 1
-        self.episode_return = self.episode_return + reward.unsqueeze(0)
-
-        episode_step = self.episode_step.clone()
-        episode_return = self.episode_return.clone()
-
-        self.episode_step[:, real_done] = 0.0
-        self.episode_return[:, real_done] = 0.0
-        if self.flags.im_cost > 0.0 and self.model_wrap:
-            self.episode_return[:, info["cur_t"] == 0, 1] = 0.0
-
-        if self.model_wrap:
-            self.last_action[info["cur_t"] == 0] = action[0, info["cur_t"] == 0]
-            self.last_action[:, 1:] = action[0, :, 1:]
-        else:
-            self.last_action[:] = action[0].unsqueeze(-1)
-
-        if self.flags.reward_clipping > 0:
-            reward = torch.clamp(
-                reward, -self.flags.reward_clipping, self.flags.reward_clipping
-            )
-
-        ret = EnvOut(
-            gym_env_out=gym_env_out,
-            model_out=model_out,
-            model_encodes=model_encodes,
-            reward=reward.unsqueeze(0),
-            done=done.unsqueeze(0),
-            real_done=real_done.unsqueeze(0),
-            truncated_done=truncated_done.unsqueeze(0),
-            episode_return=episode_return,
-            episode_step=episode_step,
-            cur_t=info["cur_t"].unsqueeze(0) if self.model_wrap else None,
-            last_action=self.last_action.unsqueeze(0),
-            max_rollout_depth=info["max_rollout_depth"].unsqueeze(0)
-            if self.model_wrap
-            else None,
-        )
-
-        return ret
-
-    def seed(self, seed):
-        self.env.seed(seed)
-
-    def close(self):
-        time.sleep(1)
-        self.env.close()
-
-
 # Standard wrappers
-
 
 class TransposeWrap(gym.ObservationWrapper):
     """Image shape to channels x weight x height"""
@@ -300,7 +162,6 @@ class TransposeWrap(gym.ObservationWrapper):
 
     def observation(self, observation):
         return np.transpose(observation, axes=(2, 0, 1))
-
 
 class NoopWrapper(gym.Wrapper):
     def __init__(self, env, cost=0.0):
@@ -338,7 +199,6 @@ class NoopWrapper(gym.Wrapper):
         self.env.restore_state(state)
         return
 
-
 class TimeLimit_(gym.Wrapper):
     def __init__(self, env, max_episode_steps=None):
         super(TimeLimit_, self).__init__(env)
@@ -369,7 +229,6 @@ class TimeLimit_(gym.Wrapper):
         self._elapsed_steps = state["timeLimit_elapsed_steps"]
         self.env.restore_state(state)
         return
-
 
 class WarpFrame(gym.ObservationWrapper):
     def __init__(self, env, width=84, height=84, grayscale=False, dict_space_key=None):
@@ -424,9 +283,7 @@ class WarpFrame(gym.ObservationWrapper):
             obs[self._key] = frame
         return obs
 
-
 # Atari-related wrapped (taken from torchbeast)
-
 
 class NoopResetEnv(gym.Wrapper):
     def __init__(self, env, noop_max=30):
@@ -459,7 +316,6 @@ class NoopResetEnv(gym.Wrapper):
     def step(self, ac):
         return self.env.step(ac)
 
-
 class FireResetEnv(gym.Wrapper):
     def __init__(self, env):
         """Take action on reset for environments that are fixed until firing."""
@@ -479,7 +335,6 @@ class FireResetEnv(gym.Wrapper):
 
     def step(self, ac):
         return self.env.step(ac)
-
 
 class EpisodicLifeEnv(gym.Wrapper):
     def __init__(self, env):
@@ -528,7 +383,6 @@ class EpisodicLifeEnv(gym.Wrapper):
         self.env.restore_state(state)
         return state
 
-
 class DoneEnv(gym.Wrapper):
     def __init__(self, env):
         """Always done=True"""
@@ -537,7 +391,6 @@ class DoneEnv(gym.Wrapper):
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
         return obs, reward, True, info
-
 
 class MaxAndSkipEnv(gym.Wrapper):
     def __init__(self, env, skip=4):
@@ -569,7 +422,6 @@ class MaxAndSkipEnv(gym.Wrapper):
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
 
-
 class ClipRewardEnv(gym.RewardWrapper):
     def __init__(self, env):
         gym.RewardWrapper.__init__(self, env)
@@ -577,7 +429,6 @@ class ClipRewardEnv(gym.RewardWrapper):
     def reward(self, reward):
         """Bin reward to {+1, 0, -1} by its sign."""
         return np.sign(reward)
-
 
 class FrameStack(gym.Wrapper):
     def __init__(self, env, k):
@@ -599,9 +450,10 @@ class FrameStack(gym.Wrapper):
             shape=(shp[:-1] + (shp[-1] * k,)),
             dtype=env.observation_space.dtype,
         )
+        self.frame_stack_n = k
 
-    def reset(self):
-        ob = self.env.reset()
+    def reset(self, **kwargs):
+        ob = self.env.reset(**kwargs)
         for _ in range(self.k):
             self.frames.append(ob)
         return self._get_ob()
@@ -626,7 +478,6 @@ class FrameStack(gym.Wrapper):
             self.frames.append(i)
         self.env.restore_state(state)
 
-
 class ScaledFloatFrame(gym.ObservationWrapper):
     def __init__(self, env):
         gym.ObservationWrapper.__init__(self, env)
@@ -638,7 +489,6 @@ class ScaledFloatFrame(gym.ObservationWrapper):
         # careful! This undoes the memory optimization, use
         # with smaller replay buffers only.
         return np.array(observation).astype(np.float32) / 255.0
-
 
 class LazyFrames(object):
     def __init__(self, frames):
@@ -677,14 +527,13 @@ class LazyFrames(object):
     def frame(self, i):
         return self._force()[..., i]
 
-
 class StateWrapper(gym.Wrapper):
     def __init__(self, env):
         gym.Wrapper.__init__(self, env)
 
     def clone_state(self):
-        # state = self.env.clone_state()
-        state = self.env.clone_state(include_rng=True)
+        state = self.env.clone_state()
+        # state = self.env.clone_state(include_rng=True)
         return {"ale_state": state}
 
     def restore_state(self, state):
@@ -703,7 +552,6 @@ class ScaledFloatFrame(gym.ObservationWrapper):
         # careful! This undoes the memory optimization, use
         # with smaller replay buffers only.
         return np.array(observation).astype(np.float32) / 255.0
-
 
 def wrap_deepmind(
     env,

@@ -3,9 +3,9 @@ import time
 from operator import itemgetter
 import ray
 import thinker.util as util
-
+from thinker.core.file_writer import FileWriter
+import torch
 AB_CAN_WRITE, AB_FULL, AB_FINISH = 0, 1, 2
-
 
 def custom_choice(tran_n, batch_size, p, replace=False):
     if np.any(np.isnan(p)):
@@ -116,31 +116,25 @@ class ActorBuffer:
         self.finish = True
 
 
-@ray.remote
-class ModelBuffer:
+class SModelBuffer:
     def __init__(self, flags):
         self.alpha = flags.priority_alpha
-
-        self.t = flags.model_unroll_length
-        self.k = flags.model_k_step_return
-
+        self.t = flags.buffer_traj_len
+        self.k = flags.model_unroll_len
         self.max_buffer_n = flags.model_buffer_n // self.t + 1  # maximum buffer length
         self.batch_size = flags.model_batch_size  # batch size in returned sample
         self.wram_up_n = (
-            flags.model_warm_up_n if not flags.load_checkpoint else flags.model_buffer_n
+            flags.model_warm_up_n if not flags.ckp else flags.model_buffer_n
         )  # number of total transition before returning samples
 
         self.buffer = []
 
         self.priorities = None
         self.next_inds = None
-        self.cur_inds = [
-            None for _ in range(flags.gpu_num_actors + flags.cpu_num_actors)
-        ]
+        self.cur_inds = {}
 
         self.base_ind = 0
         self.abs_tran_n = 0
-        self.preload_n = 0
         self.clean_m = 0
 
         self.finish = False
@@ -162,7 +156,7 @@ class ModelBuffer:
             self.priorities = np.concatenate([self.priorities, max_priorities])
 
         # to record a table for chaining entry
-        if self.cur_inds[rank] is not None:
+        if rank in self.cur_inds.keys():
             last_ind = self.cur_inds[rank] - self.base_ind
             mask = last_ind >= 0
             self.next_inds[last_ind[mask]] = (
@@ -170,10 +164,7 @@ class ModelBuffer:
             )[mask]
 
         if self.next_inds is None:
-            self.next_inds = np.full(
-                (n),
-                fill_value=np.nan,
-            )
+            self.next_inds = np.full((n), fill_value=np.nan,)
         else:
             self.next_inds = np.concatenate(
                 [self.next_inds, np.full((n), fill_value=np.nan)]
@@ -217,15 +208,17 @@ class ModelBuffer:
 
         base_ind_pri = self.base_ind * self.t
         abs_flat_inds = flat_inds + base_ind_pri
-        return data, weights, abs_flat_inds, self.abs_tran_n - self.preload_n
+        return data, weights, abs_flat_inds, self.abs_tran_n
 
     def set_finish(self):
         self.finish = True
 
-    def get_processed_n(self):
-        if self.finish:
-            return "FINISH"
-        return self.abs_tran_n - self.preload_n
+    def get_status(self):
+        return {"processed_n": self.abs_tran_n,
+                "warm_up_n": self.wram_up_n,
+                "running": self.abs_tran_n >= self.wram_up_n,
+                "finish": self.finish,
+                 }
 
     def update_priority(self, abs_flat_inds, priorities):
         """Update priority in the buffer; both input
@@ -275,14 +268,6 @@ class ModelBuffer:
             self.priorities = self.priorities[excess_n * self.t :]
             self.base_ind += excess_n
 
-    def check_preload(self):
-        return (len(self.buffer) >= self.max_buffer_n, len(self.buffer) * self.t)
-
-    def set_preload(self):
-        self.preload_n = self.abs_tran_n
-        return True
-
-
 @ray.remote
 class GeneralBuffer(object):
     def __init__(self):
@@ -307,3 +292,157 @@ class GeneralBuffer(object):
 
     def get_data(self, name):
         return self.data[name] if name in self.data else None
+    
+    def get_and_increment(self, name):
+        if name in self.data:
+            self.data[name] += 1            
+        else:
+            self.data[name] = 0
+        return self.data[name]
+
+@ray.remote
+class ModelBuffer(SModelBuffer):
+    pass
+
+@ray.remote
+class RecordBuffer(object):
+    # simply for logging return from self play thread if actor learner is not running
+    def __init__(self, flags):
+        self.flags = flags
+        self.flags.git_revision = util.get_git_revision_hash()
+        self.plogger = FileWriter(
+            xpid=flags.xpid,
+            xp_args=flags.__dict__,
+            rootdir=flags.savedir,
+            overwrite=not self.flags.ckp,
+        )
+        self.real_step = 0
+        max_actor_id = (
+            self.flags.gpu_num_actors * self.flags.gpu_num_p_actors
+            + self.flags.cpu_num_actors * self.flags.cpu_num_p_actors
+        )
+        self.last_returns = RetBuffer(max_actor_id, mean_n=400)
+        self._logger = util.logger()
+        self.preload = flags.ckp
+        self.preload_n = flags.model_buffer_n
+        self.proc_n = 0
+
+    def set_real_step(self, x):
+        self.real_step = x
+
+    def insert(self, episode_return, episode_step, real_done, actor_id):
+        T, B, *_ = episode_return.shape
+        self.proc_n += T*B
+        if self.preload and self.proc_n < self.preload_n:
+            self._logger.info("[%s] Preloading: %d / %d" % (self.flags.xpid, self.proc_n, self.preload_n,))
+            return self.real_step
+        
+        self.real_step += T*B        
+        if np.any(real_done):
+            episode_returns = episode_return[real_done]
+            episode_returns = tuple(episode_returns)
+            episode_lens = episode_step[real_done]
+            episode_lens = tuple(episode_lens)
+            done_ids = np.broadcast_to(actor_id, real_done.shape)[
+                real_done
+            ]
+            done_ids = tuple(done_ids)
+        else:
+            episode_returns, episode_lens, done_ids = (), (), ()
+        self.last_returns.insert(episode_returns, done_ids)
+        rmean_episode_return = self.last_returns.get_mean()
+        stats = {
+            "real_step": self.real_step,
+            "rmean_episode_return": rmean_episode_return,
+            "episode_returns": episode_returns,
+            "episode_lens": episode_lens,
+            "done_ids": done_ids,
+        }
+        self.plogger.log(stats)
+        print_str = ("[%s] Steps %i @ Ret %f." % (self.flags.xpid, self.real_step, stats["rmean_episode_return"],))
+        self._logger.info(print_str)
+        return self.real_step
+
+
+class RetBuffer:
+    def __init__(self, max_actor_id, mean_n=400):
+        """
+        Compute the trailing mean return by storing the last return for each actor
+        and average them;
+        Args:
+            max_actor_id (int): maximum actor id
+            mean_n (int): size of data for computing mean
+        """
+        buffer_n = mean_n // max_actor_id + 1
+        self.return_buffer = np.zeros((max_actor_id, buffer_n))
+        self.return_buffer_pointer = np.zeros(
+            max_actor_id, dtype=int
+        )  # store the current pointer
+        self.return_buffer_n = np.zeros(
+            max_actor_id, dtype=int
+        )  # store the processed data size
+        self.max_actor_id = max_actor_id
+        self.mean_n = mean_n
+        self.all_filled = False
+
+    def insert(self, returns, actor_ids):
+        """
+        Insert new returnss to the return buffer
+        Args:
+            returns (tuple): tuple of float, the return of each ended episode
+            actor_ids (tuple): tuple of int, the actor id of the corresponding ended episode
+        """
+        # actor_id is a tuple of integer, corresponding to the returns
+        if len(returns) == 0:
+            return
+        assert len(returns) == len(actor_ids)
+        for r, actor_id in zip(returns, actor_ids):
+            if actor_id >= self.max_actor_id:
+                continue
+            # Find the current pointer for the actor
+            pointer = self.return_buffer_pointer[actor_id]
+            # Update the return buffer for the actor with the new return
+            self.return_buffer[actor_id, pointer] = r
+            # Update the pointer for the actor
+            self.return_buffer_pointer[actor_id] = (
+                pointer + 1
+            ) % self.return_buffer.shape[1]
+            # Update the processed data size for the actor
+            self.return_buffer_n[actor_id] = min(
+                self.return_buffer_n[actor_id] + 1, self.return_buffer.shape[1]
+            )
+
+        if not self.all_filled:
+            # check if all filled
+            self.all_filled = np.all(
+                self.return_buffer_n >= self.return_buffer.shape[1]
+            )
+
+    def insert_raw(self, episode_returns, ind, actor_id, done):
+        episode_returns = episode_returns[done][:, ind]
+        episode_returns = tuple(episode_returns.detach().cpu().numpy())
+        done_ids = actor_id.broadcast_to(done.shape)[done]
+        done_ids = tuple(done_ids.detach().cpu().numpy())
+        self.insert(episode_returns, done_ids)
+
+    def get_mean(self):
+        """
+        Compute the mean of the returns in the buffer;
+        """
+        if self.all_filled:
+            overall_mean = np.mean(self.return_buffer)
+        else:
+            # Create a mask of filled items in the return buffer
+            col_indices = np.arange(self.return_buffer.shape[1])
+            # Create a mask of filled items in the return buffer
+            filled_mask = (
+                col_indices[np.newaxis, :] < self.return_buffer_n[:, np.newaxis]
+            )
+            if np.any(filled_mask):
+                # Compute the sum of returns for each actor considering only filled items
+                sum_returns = np.sum(self.return_buffer * filled_mask)
+                # Compute the mean for each actor by dividing the sum by the processed data size
+                overall_mean = sum_returns / np.sum(filled_mask.astype(float))
+            else:
+                overall_mean = 0.0
+        return overall_mean

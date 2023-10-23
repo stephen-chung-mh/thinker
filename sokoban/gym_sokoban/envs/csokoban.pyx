@@ -1,3 +1,4 @@
+# distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 # distutils: language = c++
 
 from libcpp cimport bool
@@ -7,9 +8,6 @@ import numpy as np
 cimport numpy as np
 np.import_array()
 from .sokoban cimport Sokoban
-#from sokoban cimport Sokoban // use this for non-package version
-
-#import matplotlib.pyplot as plt
 
 cdef class cSokoban:
 	cdef Sokoban c_sokoban
@@ -34,6 +32,7 @@ cdef class cSokoban:
 		return obs.reshape(self.obs_x,self.obs_y,3)		
 
 	def step(self, int act):
+		assert act >= 0 and act <= 4, "action should be in [0, 1, 2, 3, 4]"
 		cdef np.ndarray obs = np.zeros((self.obs_n), dtype=np.dtype("u1"))
 		cdef unsigned char[::1] obs_view = obs
 		#obs = cvarray(shape=(160*160*3,), itemsize=1, format="c")

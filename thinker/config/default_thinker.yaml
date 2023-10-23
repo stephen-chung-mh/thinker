@@ -1,0 +1,67 @@
+# the setting for default Thinker environment
+# training setting
+train_model: true # whether to train the model
+model_batch_size: 128 # training batch size of the model
+model_learning_rate: 0.0001 # model learning rate
+model_grad_norm_clipping: 0 # gradient clipping norm; non-positive for no clipping
+min_replay_ratio: 5 # minimum replay ratio (i.e. the number of times that the same transition is used to train a model on average)
+max_replay_ratio: 6 # maximum replay ratio (i.e. the number of times that the same transition is used to train a model on average)
+total_steps: 50000000 # total number of raw steps to train
+# replay buffer setting
+priority_alpha: 0.6 # alpha in prioritized sampling from the buffer
+priority_beta: 0.4 # beta in prioritized sampling from the buffer
+buffer_traj_len: 50 # length of trajectory stored in the replay buffer
+model_unroll_len: 5 # model unroll length and also the n in n-step return when training model
+model_warm_up_n: 200000 # number of augmented step before model starts to be trained
+model_buffer_n: 200000 # capacity of replay buffer in number of augmented step 
+# cost setting in training
+model_logits_loss_cost: 0.5 # cost for training model's policy
+model_vs_loss_cost: 0.25 # cost for training model's values
+model_rs_loss_cost: 1.0 # cost for training model's reward
+model_done_loss_cost: 1.0 # cost for training model's done signal
+model_img_loss_cost: 10.0 # cost for training model's state output (dual network only)
+model_reg_loss_cost: 0.0 # cost for model regularization loss
+# model setting
+dual_net: true # whether to use dual network
+model_enc_type: 0 #  reward / value encoding type for the model; 0 for no encoding, 1 for scalar encoding, 2 for unbiased vector encoding, 3 for biased vector encoding
+model_size_nn: 1 # model size mulitplier (integer)
+model_downscale_c: 2 # model channel size divisor (integer)
+model_disable_bn: true # whether to disable batch norm in model
+model_zero_init: true # whether to zero initialize the model's predicted rewards and values
+frame_stack_n: 1 # frame stacking used (if > 1, then model will only predict the most recent frames but not the stacked one)
+model_img_type: 1 # type of model's state loss: 0 for L2 loss, 1 for feature loss
+# wrapper to be used
+require_prob: false # whether to use prob to train model instead of sampled action
+wrapper_type: 0 # 0: default Thinker; 1: raw env; 2: Thinker w/ perfect model; 
+rec_t: 20 # stage length
+test_rec_t: -1 # stage length for testing; non-positive for being the same as rec_t
+max_depth: 5 # maximum search depth before forceful reset
+tree_carry: true # whether to carry the tree across stages
+return_h: true # whether to return model's hidden state
+return_x: false # whether to return the model's predicted state
+return_double: false # whether to return both root node and current node's h / raw_s
+# reward-related
+discounting: 0.99 # discount rate of the raw MDP
+reward_clip: -1 # reward clipping; if positve, the reward is clipped within the absolute value of this values; set to negative number for no clipping
+im_enable: true # whether to return imagainary reward
+cur_enable: false # whether to return curiosity reward
+cur_reward_cost: 0.0 # coefficient for curiosity loss based on reward prediction loss
+cur_v_cost: 0.0 # coefficient for curiosity loss based on value prediction loss
+cur_enc_cost: 0.0 # coefficient for curiosity loss based on state prediction loss (in terms of feature loss)
+cur_done_gate: false # whehter to give no curiosity reward when episode ends or is predicted to end
+stat_mask_type: 0 # masking hint in tree representation: 0: no masking, 1 for masking all auxiliary stat, 2 for masking all auxiliary node stat + v and pi
+# checkpoint
+xpid: '' # name of the run, automatically set if not given
+ckp: false # whether to load checkpoint; if set to true, will load checkpoint from savedir/xpid
+preload: '' # path for the folder that consists ckp_model.tar, which is used to initialize  actor
+# savedir: '../logs/__project__' # base log directory
+savedir: 'logs' # base log directory
+# misc
+profile: false # whether to output all the time statistics of the run
+parallel: false # whether to use a parallel ray actor for training the model
+base_seed: 1 # base seed for the gym environment
+# ray resources
+ray_mem: -1 # default initialized ray memory
+ray_gpu: -1 # number of initial gpu (set to -1 for auto detect)
+ray_cpu: -1 # number of initial cpu (set to -1 for auto detect)
+gpu_learn: 0.5 # gpu for the model-learning ray actor
