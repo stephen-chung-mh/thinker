@@ -327,14 +327,25 @@ class Env(gym.Wrapper):
         state = self.env.reset(self.model_net)
         return state
 
-    def step(self, action, reset, action_prob=None, ignore=False):        
+    def step(self, primary_action, reset_action=None, action_prob=None, ignore=False):        
+
+        assert primary_action.shape == (self.env_n,), \
+                    f"primary_action should have shape f{(self.env_n,)}"        
+        if self.flags.wrapper_type == 1:
+            action = primary_action                
+        else:
+            assert reset_action.shape == (self.env_n,), \
+                    f"reset should have shape f{(self.env_n,)}"
+            action = (primary_action, reset_action)            
+                
         if self.require_prob and not ignore: 
             assert action_prob is not None and action_prob.shape == (self.env_n, self.num_actions), \
                     f"action_prob should have shape f{(self.env_n, self.num_actions)}"
+        
         with torch.set_grad_enabled(False):
-            state, reward, done, info = self.env.step((action, reset), self.model_net)        
+            state, reward, done, info = self.env.step(action, self.model_net)        
         if self.train_model and info["step_status"][0] == 0 and not ignore: # assume all transition in same step within a stage
-            self._write_send_model_buffer(state, reward, done, info, action, action_prob)        
+            self._write_send_model_buffer(state, reward, done, info, primary_action, action_prob)        
         if self.train_model:
             if self.parallel:
                 if self.counter % 200 == 0: self.status = self._refresh_wait()     
