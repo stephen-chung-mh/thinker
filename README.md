@@ -218,11 +218,11 @@ state, reward, done, info = env.step(primary_action, reset_action, action_prob=N
 **Parameters:**
 
 -   `primary_action`: Imaginary/real action to be taken in the environment.    
-    -   Type: Torch tensor, numpy array, or list.
+    -   Type: Torch tensor or numpy array.
     -   Shape: `(env_n,)`
     
 -   `reset_action`: Reset action to be taken in the environment state.    
-    -   Type: Torch tensor, numpy array, or list.
+    -   Type: Torch tensor or numpy array.
     -   Shape: `(env_n,)`
     -   Each element must be either 0 or 1.
     
