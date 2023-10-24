@@ -224,8 +224,8 @@ class SelfPlayWorker:
                             env_out, actor_state, greedy=False
                         )
         state, reward, done, info = self.env.step(
-                action=actor_out.action[0], 
-                reset=actor_out.action[1], 
+                primary_action=actor_out.action[0], 
+                reset_action=actor_out.action[1], 
                 action_prob=actor_out.action_prob)
         env_out = self.create_env_out(actor_out.action, state, reward, done, info)
         return actor_out, actor_state, env_out, info

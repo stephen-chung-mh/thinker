@@ -261,7 +261,9 @@ class SLogWorker:
         while step < max_steps:
             step += 1
             actor_out, self.actor_state = self.actor_net(env_out, self.actor_state)           
-            state, reward, done, info = self.env.step(actor_out.action)
+            state, reward, done, info = self.env.step(
+                primary_action=actor_out.action[0], 
+                reset_action=actor_out.action[1])
             env_out = create_env_out(actor_out.action, state, reward, done, info, self.flags)
             if self.wrapper_type != 1:
                 ret_reset = util.decode_tree_reps(
