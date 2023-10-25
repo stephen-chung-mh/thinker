@@ -429,7 +429,7 @@ def visualize(
         )
         model_logits.append(tree_reps_["cur_logits"])
         
-        state, reward, done, info = env.step(action)
+        state, reward, done, info = env.step(action[0], action[1])
         env_out = create_env_out(action, state, reward, done, info, flags)
 
         tree_reps = util.decode_tree_reps(
