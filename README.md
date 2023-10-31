@@ -301,7 +301,7 @@ The above run is used to generate the results of the Thinker-augmented MDP in Fi
 Atari default run (change the environment if needed):
 
 ```bash
-python train.py --env BreakoutNoFrameskip-v4 --reward_clip 1 --model_size_nn 2 --discounting 0.99
+python train.py --name BreakoutNoFrameskip-v4 --reward_clip 1 --model_size_nn 2 --discounting 0.99
 ```
 
 

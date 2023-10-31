@@ -65,14 +65,16 @@ class SelfPlayWorker:
         ).unsqueeze(0)
         self.time = self.rank == 0 and flags.profile
 
-        self.env = Env(
-            name = flags.name, 
-            ray_obj = ray_obj_env,
-            env_n = env_n,
-            gpu = gpu,
-
-        )
-
+        if self.flags.parallel:
+            self.env = Env(
+                name = flags.name, 
+                ray_obj = ray_obj_env,
+                env_n = env_n,
+                gpu = gpu,
+            )
+        else:
+            self.env = Env(gpu = gpu, **vars(flags))
+            
         obs_space = self.env.observation_space
         action_space = self.env.action_space        
 
