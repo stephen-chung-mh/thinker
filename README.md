@@ -7,7 +7,7 @@ This is the official repository for the paper titled [*Thinker: Learning to Plan
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Training in Thinker-augmented MDPs](#training-in-thinker-augmented-mdps)
-- [Basic Usage](#basic-usage)
+- [Basic Usage](#basic-usage-of-the-thinker-augmented-mdp)
 - [Configuration](#configuration)
 - [Available Environments](#available-environments)
 - [Available Wrappers](#available-wrappers)
@@ -47,7 +47,7 @@ cd thinker
 pip install -e .
 ```
 
-## Training in the Thinker-augmented MDP
+## Training in Thinker-augmented MDPs
 To train actor-critic (IMPALA) on the Thinker-augmented MDP, run the following commands in the `thinker` directory:
 
 Sokoban default run:
