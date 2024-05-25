@@ -7,6 +7,7 @@ from copy import deepcopy
 from thinker.gym_add.vector_env import VectorEnv
 
 from gym import logger
+import logging
 
 # from gym.vector.vector_env import VectorEnv
 from gym.error import (
@@ -32,8 +33,9 @@ class AsyncState(Enum):
     DEFAULT = "default"
     WAITING_RESET = "reset"
     WAITING_STEP = "step"
-    WAITING_CLONE_STATE = "clone_state"
+    WAITING_CLONE_STATE = "clone_state"    
     WAITING_RESTORE_STATE = "restore_state"
+    WAITING_RENDER_STATE = "render_state"
 
 
 class AsyncVectorEnv(VectorEnv):
@@ -183,7 +185,7 @@ class AsyncVectorEnv(VectorEnv):
         _, successes = zip(*[pipe.recv() for pipe in self.parent_pipes])
         self._raise_if_errors(successes)
 
-    def reset_async(self, inds=None):
+    def reset_async(self, idx=None):
         self._assert_is_running()
         if self._state != AsyncState.DEFAULT:
             raise AlreadyPendingCallError(
@@ -191,13 +193,13 @@ class AsyncVectorEnv(VectorEnv):
                 "for a pending call to `{0}` to complete".format(self._state.value),
                 self._state.value,
             )
-        if inds is None:
+        if idx is None:
             for pipe in self.parent_pipes:
                 pipe.send(("reset", None))
         else:
-            for n, ind in enumerate(inds):
-                self.parent_pipes[ind].send(("reset", None))
-        self.inds = inds
+            for n, i in enumerate(idx):
+                self.parent_pipes[i].send(("reset", None))
+        self.idx = idx
         self._state = AsyncState.WAITING_RESET
 
     def reset_wait(self, timeout=None):
@@ -229,8 +231,8 @@ class AsyncVectorEnv(VectorEnv):
 
         rec_pipes = (
             self.parent_pipes
-            if self.inds is None
-            else [self.parent_pipes[i] for i in self.inds]
+            if self.idx is None
+            else [self.parent_pipes[i] for i in self.idx]
         )
         results, successes = zip(*[pipe.recv() for pipe in rec_pipes])
         self._raise_if_errors(successes)
@@ -238,19 +240,19 @@ class AsyncVectorEnv(VectorEnv):
 
         if not self.shared_memory:
             self.observations = concatenate(
-                results, self.observations, self.single_observation_space
+                self.single_observation_space, results, self.observations
             )
-        if self.inds is None:
+        if self.idx is None:
             ret_observations = (
                 deepcopy(self.observations) if self.copy else self.observations
             )
         else:
-            ret_observations = np.array([self.observations[i] for i in self.inds])
+            ret_observations = np.array([self.observations[i] for i in self.idx])
             if self.copy:
                 ret_observations = deepcopy(ret_observations)
         return ret_observations
 
-    def clone_state_async(self, inds):
+    def clone_state_async(self, idx=None):
         self._assert_is_running()
         if self._state != AsyncState.DEFAULT:
             raise AlreadyPendingCallError(
@@ -258,9 +260,10 @@ class AsyncVectorEnv(VectorEnv):
                 "for a pending call to `{0}` to complete.".format(self._state.value),
                 self._state.value,
             )
-        for n, ind in enumerate(inds):
-            self.parent_pipes[ind].send(("clone_state", None))
-        self.inds = inds
+        if idx is None: idx = np.arange(len(self.parent_pipes))
+        for n, i in enumerate(idx):
+            self.parent_pipes[i].send(("clone_state", None))
+        self.idx = idx
         self._state = AsyncState.WAITING_CLONE_STATE
 
     def clone_state_wait(self, timeout=None):
@@ -278,24 +281,25 @@ class AsyncVectorEnv(VectorEnv):
                 "The call to `clone_state_wait` has timed out after "
                 "{0} second{1}.".format(timeout, "s" if timeout > 1 else "")
             )
-        rec_pipes = [self.parent_pipes[i] for i in self.inds]
+        rec_pipes = [self.parent_pipes[i] for i in self.idx]
         results, successes = zip(*[pipe.recv() for pipe in rec_pipes])
         self._raise_if_errors(successes)
         self._state = AsyncState.DEFAULT
 
         return results
 
-    def restore_state_async(self, env_states, inds):
+    def restore_state_async(self, env_states, idx=None):
         self._assert_is_running()
+        if idx is None: idx = np.arange(len(self.parent_pipes))
         if self._state != AsyncState.DEFAULT:
             raise AlreadyPendingCallError(
                 "Calling `restore_state_async` while waiting "
                 "for a pending call to `{0}` to complete.".format(self._state.value),
                 self._state.value,
             )
-        for n, ind in enumerate(inds):
-            self.parent_pipes[ind].send(("restore_state", env_states[n]))
-        self.inds = inds
+        for n, i in enumerate(idx):
+            self.parent_pipes[i].send(("restore_state", env_states[n]))
+        self.idx = idx
         self._state = AsyncState.WAITING_RESTORE_STATE
 
     def restore_state_wait(self, timeout=None):
@@ -313,14 +317,50 @@ class AsyncVectorEnv(VectorEnv):
                 "The call to `clone_state_wait` has timed out after "
                 "{0} second{1}.".format(timeout, "s" if timeout > 1 else "")
             )
-        rec_pipes = [self.parent_pipes[i] for i in self.inds]
+        rec_pipes = [self.parent_pipes[i] for i in self.idx]
         results, successes = zip(*[pipe.recv() for pipe in rec_pipes])
         self._raise_if_errors(successes)
         self._state = AsyncState.DEFAULT
 
         return results
 
-    def step_async(self, actions, inds=None):
+    def render_async(self, idx=None, *args, **kwargs):
+        self._assert_is_running()
+        if self._state != AsyncState.DEFAULT:
+            raise AlreadyPendingCallError(
+                "Calling `render_state_async` while waiting "
+                "for a pending call to `{0}` to complete.".format(self._state.value),
+                self._state.value,
+            )
+        if idx is None: idx = range(len(self.parent_pipes))
+        for n, i in enumerate(idx):
+            self.parent_pipes[i].send(("render", (args, kwargs)))
+        self.idx = idx
+        self._state = AsyncState.WAITING_RENDER_STATE
+
+    def render_wait(self, timeout=None):
+        self._assert_is_running()
+        if self._state != AsyncState.WAITING_RENDER_STATE:
+            raise NoAsyncCallError(
+                "Calling `render_state_wait` without any prior call "
+                "to `render_state_async`.",
+                AsyncState.WAITING_RENDER_STATE.value,
+            )
+
+        if not self._poll(timeout):
+            self._state = AsyncState.DEFAULT
+            raise mp.TimeoutError(
+                "The call to `render_state_wait` has timed out after "
+                "{0} second{1}.".format(timeout, "s" if timeout > 1 else "")
+            )
+        rec_pipes = [self.parent_pipes[i] for i in self.idx]
+        results, successes = zip(*[pipe.recv() for pipe in rec_pipes])
+        self._raise_if_errors(successes)
+        self._state = AsyncState.DEFAULT
+
+        return results
+
+    def step_async(self, actions, idx=None):
         """
         Parameters
         ----------
@@ -334,13 +374,13 @@ class AsyncVectorEnv(VectorEnv):
                 "for a pending call to `{0}` to complete.".format(self._state.value),
                 self._state.value,
             )
-        if inds is None:
+        if idx is None:
             for pipe, action in zip(self.parent_pipes, actions):
                 pipe.send(("step", action))
         else:
-            for n, ind in enumerate(inds):
-                self.parent_pipes[ind].send(("step", actions[n]))
-        self.inds = inds
+            for n, i in enumerate(idx):
+                self.parent_pipes[i].send(("step", actions[n]))
+        self.idx = idx
         self._state = AsyncState.WAITING_STEP
 
     def step_wait(self, timeout=None):
@@ -380,8 +420,8 @@ class AsyncVectorEnv(VectorEnv):
             )
         rec_pipes = (
             self.parent_pipes
-            if self.inds is None
-            else [self.parent_pipes[i] for i in self.inds]
+            if self.idx is None
+            else [self.parent_pipes[i] for i in self.idx]
         )
         results, successes = zip(*[pipe.recv() for pipe in rec_pipes])
         self._raise_if_errors(successes)
@@ -389,26 +429,28 @@ class AsyncVectorEnv(VectorEnv):
         observations_list, rewards, dones, infos = zip(*results)
 
         if not self.shared_memory:
-            if self.inds is None:
+            if self.idx is None:
                 self.observations = concatenate(
-                    observations_list, self.observations, self.single_observation_space
+                    self.single_observation_space,
+                    observations_list,
+                    self.observations,
                 )
                 ret_observations = (
                     deepcopy(self.observations) if self.copy else self.observations
                 )
             else:
-                for i in self.inds:
+                for i in self.idx:
                     self.observations[i] = observations_list[i]
-                ret_observations = np.array([self.observations[i] for i in self.inds])
+                ret_observations = np.array([self.observations[i] for i in self.idx])
                 if self.copy:
                     ret_observations = deepcopy(ret_observations)
         else:
-            if self.inds is None:
+            if self.idx is None:
                 ret_observations = (
                     deepcopy(self.observations) if self.copy else self.observations
                 )
             else:
-                ret_observations = np.array([self.observations[i] for i in self.inds])
+                ret_observations = np.array([self.observations[i] for i in self.idx])
                 if self.copy:
                     ret_observations = deepcopy(ret_observations)
 
@@ -523,38 +565,48 @@ def _worker(index, env_fn, pipe, parent_pipe, shared_memory, error_queue):
     parent_pipe.close()
     try:
         while True:
+            if pipe.closed:
+                logging.error(f"Worker {index}: Pipe is closed unexpectedly")
+                break
             command, data = pipe.recv()
             if command == "reset":
                 observation = env.reset()
-                pipe.send((observation, True))
+                pipe.send((observation, 1))
             elif command == "step":
                 observation, reward, done, info = env.step(data)
                 # if done: observation = env.reset()
-                pipe.send(((observation, reward, done, info), True))
+                pipe.send(((observation, reward, done, info), 1))
             elif command == "clone_state":
                 env_state = env.clone_state()
-                pipe.send((env_state, True))
+                pipe.send((env_state, 1))
             elif command == "restore_state":
                 env_state = env.restore_state(data)
-                pipe.send((None, True))
+                pipe.send((None, 1))
+            elif command == "render":
+                env_state = env.render(*data[0], **data[1])
+                pipe.send((env_state, 1))          
             elif command == "seed":
                 env.seed(data)
-                pipe.send((None, True))
+                pipe.send((None, 1))
             elif command == "close":
                 env.close()
-                pipe.send((None, True))
+                pipe.send((None, 1))
                 break
             elif command == "_check_observation_space":
-                pipe.send((data == env.observation_space, True))
+                pipe.send((data == env.observation_space, 1))
             else:
                 raise RuntimeError(
                     "Received unknown command `{0}`. Must "
                     "be one of {`reset`, `step`, `seed`, `close`, "
                     "`_check_observation_space`}.".format(command)
                 )
-    except (KeyboardInterrupt, Exception):
+            
+    except EOFError:
+        logging.error(f"Worker {index}: Pipe closed unexpectedly (EOFError)")
+    except Exception as e:
+        logging.error(f"Worker {index}: Unexpected error - {e}")
         error_queue.put((index,) + sys.exc_info()[:2])
-        pipe.send((None, False))
+        pipe.send((None, 0))
     finally:
         env.close()
 
@@ -566,13 +618,16 @@ def _worker_shared_memory(index, env_fn, pipe, parent_pipe, shared_memory, error
     parent_pipe.close()
     try:
         while True:
+            if pipe.closed:
+                logging.error(f"Worker {index}: Pipe is closed unexpectedly")
+                break
             command, data = pipe.recv()
             if command == "reset":
                 observation = env.reset()
                 write_to_shared_memory(
                         observation_space, index, observation, shared_memory
                 )
-                pipe.send((None, True))
+                pipe.send((None, 1))
             elif command == "step":
                 observation, reward, done, info = env.step(data)
                 # if done:
@@ -580,29 +635,35 @@ def _worker_shared_memory(index, env_fn, pipe, parent_pipe, shared_memory, error
                 write_to_shared_memory(
                     observation_space, index, observation, shared_memory
                 )
-                pipe.send(((None, reward, done, info), True))
+                pipe.send(((None, reward, done, info), 1))
             elif command == "clone_state":
                 env_state = env.clone_state()
-                pipe.send((env_state, True))
+                pipe.send((env_state, 1))
             elif command == "restore_state":
                 env_state = env.restore_state(data)
-                pipe.send((None, True))
+                pipe.send((None, 1))
+            elif command == "render":
+                env_state = env.render(*data[0], **data[1])
+                pipe.send((env_state, 1))
             elif command == "seed":
                 env.seed(data)
-                pipe.send((None, True))
+                pipe.send((None, 1))
             elif command == "close":
-                pipe.send((None, True))
+                pipe.send((None, 1))
                 break
             elif command == "_check_observation_space":
-                pipe.send((data == observation_space, True))
+                pipe.send((data == observation_space, 1))
             else:
                 raise RuntimeError(
                     "Received unknown command `{0}`. Must "
                     "be one of {`reset`, `step`, `seed`, `close`, "
                     "`_check_observation_space`}.".format(command)
                 )
-    except (KeyboardInterrupt, Exception):
+    except EOFError:
+        logging.error(f"Worker {index}: Pipe closed unexpectedly (EOFError)")
+    except Exception as e:
+        logging.error(f"Worker {index}: Unexpected error - {e}")
         error_queue.put((index,) + sys.exc_info()[:2])
-        pipe.send((None, False))
+        pipe.send((None, 0))
     finally:
         env.close()

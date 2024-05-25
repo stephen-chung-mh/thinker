@@ -6,20 +6,14 @@ import numpy as np
 import traceback
 import torch
 import ray
-from thinker.buffer import AB_CAN_WRITE, AB_FULL, AB_FINISH
+from thinker.buffer import AB_FULL, AB_FINISH
 from thinker.actor_net import ActorNet, ActorOut
 from thinker.learn_actor import ActorLearner, SActorLearner
 from thinker.main import Env
 import thinker.util as util
 
-_fields = ("tree_reps", "real_states", "xs", "hs")
-_fields += ("reward", "episode_return", "episode_step")
-_fields += ("done", "real_done", "truncated_done")
-_fields += ("max_rollout_depth", "step_status")
-_fields += ("last_pri", "last_reset")
-EnvOut = namedtuple("EnvOut", _fields)
+from thinker.util import EnvOut
 _fields = tuple(ActorOut._fields) + tuple(EnvOut._fields) + ("id",)
-
 exc_list = ["action",
             "action_prob",
             "entropy_loss",
@@ -43,14 +37,17 @@ class SelfPlayWorker:
 
         self.actor_buffer = ray_obj_actor["actor_buffer"]
         self.actor_param_buffer = ray_obj_actor["actor_param_buffer"]
-        self.test_buffer = None
+
+        self.log = not flags.train_actor
+        if self.log: 
+            self.self_play_buffer = ray_obj_actor["self_play_buffer"]
+            self.real_step_ptr = None
 
         self._logger.info(
-            "Initializing actor %d with device %s %s"
+            "Initializing actor %d with device %s"
             % (
                 rank,
                 "cuda" if gpu else "cpu",
-                "(test mode)" if self.test_buffer is not None else "",
             )
         )
 
@@ -71,6 +68,7 @@ class SelfPlayWorker:
                 ray_obj = ray_obj_env,
                 env_n = env_n,
                 gpu = gpu,
+                timing = self.time,
             )
         else:
             self.env = Env(gpu = gpu, **vars(flags))
@@ -85,15 +83,16 @@ class SelfPlayWorker:
             actor_param = {
                 "obs_space":obs_space,
                 "action_space":action_space,
-                "flags":flags
+                "flags":flags,
+                "tree_rep_meaning": self.env.get_tree_rep_meaning() if self.flags.wrapper_type != 1 else None,
             }
             self.actor_net = ActorNet(**actor_param)
-            if self.rank == 0:
+            if self.rank == 0 and not self.flags.mcts:
                 self._logger.info(
                     "Actor network size: %d"
                     % sum(p.numel() for p in self.actor_net.parameters())
                 )
-            self._load_net()          
+            if not self.flags.mcts: self._load_net()          
             self.actor_net.to(self.device)
             self.actor_net.train(False)
             if self.train_actor and self.rank == 0:
@@ -111,25 +110,15 @@ class SelfPlayWorker:
         self.disable_thinker = flags.wrapper_type == 1
         self.finish_train_actor = False
 
-    def gen_data(self, test_eps_n: int = 0, verbose: bool = True):
+    def gen_data(self, verbose: bool = True):
         """Generate self-play data
         Args:
-            test_eps_n (int): number of episode to test for (only for testing mode);
-            if set to non-zero, the worker will stop once reaching test_eps_n episodes
-            and the data will not be sent out to model or actor buffer
             verbose (bool): whether to print output
         """
         try:
             if verbose:
-                self._logger.info(
-                    "Actor %d started. %s"
-                    % (self.rank, "(test mode)" if test_eps_n > 0 else "")
-                )
+                self._logger.info("Actor %d started." % self.rank)
             n = 0
-            if test_eps_n > 0:
-                self.test_eps_done_n = torch.zeros(
-                    self.env_n, device=self.device
-                )
             state = self.env.reset()
             env_out = self.init_env_out(state)                        
             actor_state = self.actor_net.initial_state(
@@ -151,8 +140,8 @@ class SelfPlayWorker:
                         not info["model_status"]["running"] and
                         not info["model_status"]["finish"]
                         and self.flags.ckp) 
-                if send_buffer:
-                    self.write_actor_buffer(env_out, actor_out, 0)
+                if send_buffer or self.log:
+                    self.write_actor_buffer(env_out, actor_out, 0, log_only = not send_buffer and self.log)
                 if self.time: self.timing.time("misc1")
          
                 with torch.set_grad_enabled(False):
@@ -162,7 +151,7 @@ class SelfPlayWorker:
                             self.env_step(env_out, actor_state)
                         if self.time: self.timing.time("step env")
                         # write the data to the respective buffers
-                        if send_buffer: self.write_actor_buffer(env_out, actor_out, t + 1)
+                        if send_buffer or self.log: self.write_actor_buffer(env_out, actor_out, t + 1, log_only = not send_buffer and self.log)
                         if self.time: self.timing.time("finish actor buffer")                      
    
                 if send_buffer and self.flags.parallel_actor:
@@ -186,11 +175,28 @@ class SelfPlayWorker:
                             ray.put(self.actor_local_buffer),
                             ray.put(initial_actor_state),
                         )
-                    if self.time: self.timing.time("send actor buffer")                    
+                    if self.time: self.timing.time("send actor buffer")     
+
+                if self.log:
+                    if self.real_step_ptr is not None: 
+                        self.real_step = ray.get(self.real_step_ptr)                        
+                        if self.flags.mcts:
+                            self.actor_net.set_real_step(self.real_step)
+
+                    self.real_step_ptr = self.self_play_buffer.insert.remote(
+                        step_status = ray.put(self.actor_local_buffer.step_status), 
+                        episode_return = ray.put(self.actor_local_buffer.episode_return), 
+                        episode_step = ray.put(self.actor_local_buffer.episode_step), 
+                        real_done = ray.put(self.actor_local_buffer.real_done), 
+                        actor_id = ray.put(self.actor_local_buffer.id), 
+                    )
   
                 if self.time: self.timing.time("mics3")
       
                 if send_buffer and not self.flags.parallel_actor and hasattr(self, "actor_local_buffer"):
+                    initial_actor_state = util.tuple_map(
+                        initial_actor_state, lambda x: x.detach()   
+                    )
                     data = (self.actor_local_buffer, initial_actor_state)
                     self.actor_net.train(True)
                     self.train_actor = not self.actor_learner.consume_data(data)
@@ -213,38 +219,44 @@ class SelfPlayWorker:
                 if fin: 
                     self._logger.info("Terminating self-play thread %d" % self.rank)
                     self.env.close()                    
+                    self._logger.info("Terminated self-play thread %d" % self.rank)
                     return True
 
         except Exception as e:
             self._logger.error(f"Exception detected in self_play: {e}")
             self._logger.error(traceback.format_exc())
-        finally:
             return False
     
     def env_step(self, env_out, actor_state):
         actor_out, actor_state = self.actor_net(
-                            env_out, actor_state, greedy=False
+                            env_out = env_out, 
+                            core_state = actor_state, 
+                            greedy = False,
                         )
+        if not self.disable_thinker:
+            primary_action, reset_action = actor_out.action
+        else:
+            primary_action, reset_action = actor_out.action, None
         state, reward, done, info = self.env.step(
-                primary_action=actor_out.action[0], 
-                reset_action=actor_out.action[1], 
-                action_prob=actor_out.action_prob)
+                primary_action=primary_action, 
+                reset_action=reset_action, 
+                action_prob=actor_out.action_prob[-1])
         env_out = self.create_env_out(actor_out.action, state, reward, done, info)
         return actor_out, actor_state, env_out, info
 
-    def write_actor_buffer(self, env_out: EnvOut, actor_out: ActorOut, t: int):
+    def write_actor_buffer(self, env_out: EnvOut, actor_out: ActorOut, t: int, log_only: bool = False):
         # write to local buffer
+        if log_only: include_fields = ["step_status", "episode_return", "episode_step", "real_done"]
+
         if t == 0:            
-            if self.flags.parallel_actor:
-                id = self.actor_id
-            else:
-                id = [self.actor_id[0]]
-            out = {"id": id}
+            out = {}
+            
             for field in TrainActorOut._fields:
-                if field in ["id"]: continue
-                if field == "real_stats" and not self.see_real_state: continue
-                val = getattr(env_out if field in EnvOut._fields else actor_out, field)
                 out[field] = None
+                if log_only and field not in include_fields: continue
+                if field in ["id"]: continue                
+                if field == "real_states" and not self.flags.see_real_state: continue
+                val = getattr(env_out if field in EnvOut._fields else actor_out, field)                
                 if val is None: continue
                 if self.flags.parallel_actor:
                     out[field] = torch.empty(
@@ -256,14 +268,24 @@ class SelfPlayWorker:
                 else:
                     out[field] = []
                 # each is in the shape of (T x B xdim_1 x dim_2 ...)
+            
+            if self.flags.parallel_actor:
+                id = self.actor_id
+            else:
+                id = [self.actor_id[0]]
+            out["id"] = id
+
             self.actor_local_buffer = TrainActorOut(**out)
 
         for field in TrainActorOut._fields:
+            if log_only and field not in include_fields: continue
             v = getattr(self.actor_local_buffer, field)
-            if v is not None and field not in ["id"]:
+            if v is not None and field not in ["id"]:                
                 new_val = getattr(
                     env_out if field in EnvOut._fields else actor_out, field
-                )[0]
+                )
+                assert new_val is not None, f"{field} cannot be None"
+                new_val = new_val[0]
                 if self.flags.parallel_actor:
                     v[t] = new_val
                 else:
@@ -285,10 +307,10 @@ class SelfPlayWorker:
             self.timing.time("move_actor_buffer_to_cpu")
 
     def init_env_out(self, *args, **kwargs):
-        return init_env_out(*args, **kwargs, flags=self.flags)
+        return util.init_env_out(*args, **kwargs, flags=self.flags, dim_actions=self.actor_net.dim_actions, tuple_action=self.actor_net.tuple_action)
 
     def create_env_out(self, *args, **kwargs):
-        return create_env_out(*args, **kwargs, flags=self.flags)
+        return util.create_env_out(*args, **kwargs, flags=self.flags)
 
     def _load_net(self):
         if self.rank == 0:
@@ -326,77 +348,3 @@ class SelfPlayWorker:
                 del weights
                 break                
             time.sleep(0.1)  
-
-def init_env_out(state, flags):
-        # minimum env_out for actor_net
-        num_rewards = 1        
-        num_rewards += int(flags.im_cost > 0.0)
-        num_rewards += int(flags.cur_cost > 0.0)
-
-        env_n = state["real_states"].shape[0]
-        device = state["real_states"].device
-
-        out = {
-            "last_pri": torch.zeros(env_n, dtype=torch.long, device=device),
-            "last_reset": torch.zeros(env_n, dtype=torch.long, device=device),
-            "reward": torch.zeros((env_n, num_rewards), 
-                                dtype=torch.float, device=device),
-            "done": torch.zeros(env_n, dtype=torch.bool, device=device),
-            "step_status": torch.zeros(env_n, dtype=torch.long, device=device),
-        }
-
-        for field in EnvOut._fields:    
-            if field not in out:
-                out[field] = None
-            else:
-                continue
-            if field in state.keys():
-                out[field] = state[field]
-
-        for k, v in out.items():
-            if v is not None:
-                out[k] = torch.unsqueeze(v, dim=0)
-        env_out = EnvOut(**out)        
-        return env_out
-        
-
-def create_env_out(action, state, reward, done, info, flags):
-    if flags.wrapper_type == 0:    
-        aug_reward = [reward]
-        aug_epsoide_return = [info['episode_return']]
-        if flags.im_cost > 0:
-            aug_reward.append(info["im_reward"])
-            aug_epsoide_return.append(info["im_episode_return"])
-        if flags.cur_cost > 0:
-            aug_reward.append(info["cur_reward"])
-            aug_epsoide_return.append(info["cur_episode_return"])
-        aug_reward = torch.stack(aug_reward, dim=-1)
-        aug_epsoide_return = torch.stack(aug_epsoide_return, dim=-1)
-    else:
-        aug_reward = torch.unsqueeze(reward, -1)
-        aug_epsoide_return = torch.unsqueeze(info['episode_return'], -1)
-    out = {"reward": aug_reward, 
-            "episode_return": aug_epsoide_return,
-            "done": done,
-            }
-    if not flags.wrapper_type == 1:    
-        out["last_pri"] = action[0]
-        out["last_reset"] = action[1]
-    else:
-        out["last_pri"] = action
-
-    for field in EnvOut._fields:    
-        if field not in out:
-            out[field] = None
-        else:
-            continue
-        if field in state.keys():
-            out[field] = state[field]
-        if field in info.keys():
-            out[field] = info[field]
-    
-    for k, v in out.items():
-        if v is not None:
-            out[k] = torch.unsqueeze(v, dim=0)
-    env_out = EnvOut(**out)
-    return env_out    

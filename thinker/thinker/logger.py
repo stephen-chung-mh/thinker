@@ -7,39 +7,44 @@ import traceback
 import ray
 import thinker.util as util
 from thinker.actor_net import ActorNet
-from thinker.self_play import init_env_out, create_env_out
 from thinker.main import Env
 
 def gen_video_wandb(video_stats):
     import cv2
 
-    # Generate video; only works for rgb channels
+    # Generate video
     imgs = []
-    hw = video_stats["real_imgs"][0].shape[1]
+    h, w, c = video_stats["real_imgs"][0].shape
 
     for i in range(len(video_stats["real_imgs"])):
-        img = np.zeros(shape=(3, hw, hw * 2), dtype=np.uint8)
+        img = np.zeros(shape=(h, w * 2, 3), dtype=np.uint8)
         real_img = np.copy(video_stats["real_imgs"][i])
         im_img = np.copy(video_stats["im_imgs"][i])
+        if c == 1:
+            real_img = np.repeat(real_img, 3, axis=2)
+            im_img = np.repeat(im_img, 3, axis=2)
 
         if video_stats["status"][i] == 1:
-            im_img[0, :, :] = 255 * 0.3 + im_img[0, :, :] * 0.7
-            im_img[1, :, :] = 255 * 0.3 + im_img[1, :, :] * 0.7
+            # reset; yellow tint
+            im_img[:, :, 0] = 255 * 0.3 + im_img[:, :, 0] * 0.7
+            im_img[:, :, 1] = 255 * 0.3 + im_img[:, :, 1] * 0.7
+        elif video_stats["status"][i] == 3:
+            # force reset; red tint
+            im_img[:, :, 0] = 255 * 0.3 + im_img[:, :, 0] * 0.7
         elif video_stats["status"][i] == 0:
-            im_img[2, :, :] = 255 * 0.3 + im_img[2, :, :] * 0.7
+            # real reset; blue tint
+            im_img[:, :, 2] = 255 * 0.3 + im_img[:, :, 2] * 0.7
 
-        img[:, :, :hw] = real_img
-        img[:, :, hw:] = im_img
+        img[:, :w] = real_img
+        img[:, w:] = im_img
         imgs.append(img)
 
     enlarge_fcator = 3
     new_imgs = []
     for img in imgs:
-        _, height, width = img.shape
-        new_height, new_width = height * enlarge_fcator, width * enlarge_fcator
-        img = np.transpose(img, (1, 2, 0))
+        new_h, new_w = h * enlarge_fcator, w * enlarge_fcator * 2
         resized_img = cv2.resize(
-            img, (new_width, new_height), interpolation=cv2.INTER_NEAREST
+            img, (new_w, new_h), interpolation=cv2.INTER_NEAREST
         )
         resized_img = np.transpose(resized_img, (2, 0, 1))
         new_imgs.append(resized_img)
@@ -52,13 +57,15 @@ class SLogWorker:
         self.flags = flags
         self.ckpdir = flags.ckpdir
         self.actor_log_path = os.path.join(self.ckpdir, "logs.csv")
-        self.model_log_path = os.path.join(self.ckpdir, "logs_model.csv")
+        self.model_log_path = os.path.join(self.ckpdir, "logs_model.csv")        
         self.actor_net_path = os.path.join(self.ckpdir, "ckp_actor.tar")
-        self.model_net_path = os.path.join(self.ckpdir, "ckp_model.tar")
+        self.model_net_path = os.path.join(self.ckpdir, "ckp_model.tar")        
         self.actor_fields = None
         self.model_fields = None
+        self.vp_fields = None
         self.last_actor_tick = -1
         self.last_model_tick = -1
+        self.last_vp_tick = -1
         self.real_step = -1
         self.last_real_step_v = -1
         self.last_real_step_c = -1
@@ -94,13 +101,14 @@ class SLogWorker:
             actor_param = {
                         "obs_space":obs_space,
                         "action_space":action_space,
-                        "flags":flags
+                        "flags":flags,
+                        "tree_rep_meaning": self.env.get_tree_rep_meaning(),
                     }
 
             self.actor_net = ActorNet(**actor_param)
             self.actor_net.to(self.device)
             self.actor_net.train(False)
-
+        
     @torch.no_grad()
     def start(self):
         try:
@@ -112,8 +120,8 @@ class SLogWorker:
 
                 # visualize policy
                 if (
+                    self.vis_policy and 
                     self.real_step - self.last_real_step_v >= self.flags.policy_vis_freq
-                    and self.vis_policy
                 ):
                     self._logger.info(
                         f"Steps {self.real_step}: Uploading video to wandb..."
@@ -134,7 +142,7 @@ class SLogWorker:
                     )
                     self.last_real_step_c = self.real_step
                     self.wlogger.wandb.save(
-                        os.path.join(self.ckpdir, "*"), self.ckpdir
+                        os.path.join(self.ckpdir, "*")
                     )
                     self._logger.info(
                         f"Steps {self.real_step}: Finish uploading files to wandb..."
@@ -192,6 +200,7 @@ class SLogWorker:
                     self.last_model_tick,
                     "model",
                 )
+           
             stat = {}
             if self.log_model and model_stat is not None:                
                 stat.update(model_stat)
@@ -205,7 +214,7 @@ class SLogWorker:
             if self.video is not None:
                 stat.update(self.video)
                 self.video = None
-
+                
             excludes = ["_tick", "# _tick", "_time"]
             for y in excludes:
                 stat.pop(y, None)
@@ -221,6 +230,7 @@ class SLogWorker:
         return
 
     def visualize_wandb(self):
+            
         if not os.path.exists(self.actor_net_path):
             self._logger.info(
                 f"Steps {self.real_step}: Actor net checkpoint {self.actor_net_path} does not exist"
@@ -243,7 +253,7 @@ class SLogWorker:
 
         if True: #not self.env_init:
             state = self.env.reset()
-            env_out = init_env_out(state, self.flags)            
+            env_out = util.init_env_out(state, self.flags, self.actor_net.dim_actions, self.actor_net.tuple_action)            
             self.actor_state = self.actor_net.initial_state(batch_size=1)
         else:
             env_out = self.last_env_out
@@ -256,50 +266,51 @@ class SLogWorker:
 
         video_stats = {"real_imgs": [], "im_imgs": [], "status": []}
         start_record = False
-        copy_n = 3
+        if self.flags.grayscale and "Sokoban" not in self.flags.name:
+            copy_n = 1
+        else:
+            copy_n = 3
 
         while step < max_steps:
             step += 1
-            actor_out, self.actor_state = self.actor_net(env_out, self.actor_state)           
+            actor_out, self.actor_state = self.actor_net(env_out, self.actor_state)     
+            primary_action, reset_action = actor_out.action      
             state, reward, done, info = self.env.step(
-                primary_action=actor_out.action[0], 
-                reset_action=actor_out.action[1])
-            env_out = create_env_out(actor_out.action, state, reward, done, info, self.flags)
+                primary_action=primary_action, 
+                reset_action=reset_action)
+            env_out = util.create_env_out(actor_out.action, state, reward, done, info, self.flags)
             if self.wrapper_type != 1:
-                ret_reset = util.decode_tree_reps(
-                    env_out.tree_reps, self.actor_net.num_actions, self.flags.model_enc_type
-                )["reset"]
+                ret_reset = self.env.decode_tree_reps(env_out.tree_reps)["cur_reset"]
             else:
                 ret_reset = False
+                
+            last_step_real = (env_out.step_status == 0) | (env_out.step_status == 3)
+            if last_step_real: 
+                root_real_states = env_out.real_states[0, 0, -copy_n:]
+                root_xs = env_out.xs[0, 0, -copy_n:]
 
             if start_record:                
                 # record data for generating video
                 if ret_reset:
-                    video_stats["real_imgs"].append(video_stats["real_imgs"][-1])
-                    video_stats["im_imgs"].append(video_stats["real_imgs"][-1])
+                    video_stats["real_imgs"].append(root_real_states)
+                    video_stats["im_imgs"].append(root_xs)
                     video_stats["status"].append(1)
-                if env_out.step_status == 0:
-                    video_stats["real_imgs"].append(
-                        env_out.xs[0, 0, -copy_n:]
-                    )
+                if last_step_real:
+                    video_stats["real_imgs"].append(root_real_states)                    
                     video_stats["status"].append(0)
                 else:
-                    video_stats["real_imgs"].append(video_stats["real_imgs"][-1])
+                    video_stats["real_imgs"].append(root_real_states)
                     video_stats["status"].append(2)
                 video_stats["im_imgs"].append(env_out.xs[0, 0, -copy_n:])
 
             if (
                 step >= max_steps - record_steps
-                and env_out.step_status == 0
+                and last_step_real
                 and not start_record
             ):
-                video_stats["real_imgs"].append(
-                    env_out.xs[0, 0, -copy_n:]
-                )
-                video_stats["im_imgs"].append(video_stats["real_imgs"][-1])
-                video_stats["status"].append(
-                    0
-                )  # 0 for real step, 1 for reset, 2 for normal
+                video_stats["real_imgs"].append(root_real_states)
+                video_stats["im_imgs"].append(env_out.xs[0, 0, -copy_n:])
+                video_stats["status"].append(0) # 0 for real step, 1 for reset, 2 for normal                
                 start_record = True
 
             if self.timer() - start_time > self.log_freq:
@@ -307,9 +318,23 @@ class SLogWorker:
                 self.log_stat()
 
         self.last_env_out = env_out
-        for f in ["real_imgs", "im_imgs"]:
-            for l in range(len(video_stats[f])):
-                video_stats[f][l] = self.env.unnormalize(video_stats[f][l]).cpu().numpy()
+
+        _, real_h, real_w = video_stats["real_imgs"][0].shape
+        _, im_h, im_w  = video_stats["im_imgs"][0].shape
+        need_resacle = real_h != im_h or real_w != im_w
+        import cv2
+
+        for l in range(len(video_stats["real_imgs"])):
+            video_stats["real_imgs"][l] = np.transpose((video_stats["real_imgs"][l]).cpu().numpy(), (1, 2, 0))                    
+
+        for l in range(len(video_stats["im_imgs"])):
+            im_img = np.transpose((video_stats["im_imgs"][l]).cpu().numpy(), (1, 2, 0))
+            im_img = np.clip(im_img, 0, 1) * 255
+            im_img = im_img.astype(np.uint8)  
+            if need_resacle:          
+                im_img = cv2.resize(im_img, (real_w, real_h), interpolation=cv2.INTER_NEAREST)
+            video_stats["im_imgs"][l] = im_img
+
         video = gen_video_wandb(video_stats)
         self.video = {f"policy": self.wlogger.wandb.Video(video, fps=5, format="gif")}
         self.env_init = True

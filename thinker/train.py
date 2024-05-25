@@ -2,7 +2,7 @@ import time
 import os
 import ray
 import torch
-from thinker.buffer import ActorBuffer, GeneralBuffer
+from thinker.buffer import ActorBuffer, GeneralBuffer, SelfPlayBuffer
 from thinker.self_play import SelfPlayWorker
 from thinker.logger import LogWorker
 from thinker.main import ray_init
@@ -36,9 +36,14 @@ if __name__ == "__main__":
         actor_buffer = None
         actor_param_buffer = None
     
-    ray_obj_env = ray_init(save_flags=False, **vars(flags))
+    ray_obj_env = ray_init(flags=flags, save_flags=False, **vars(flags))
+    ray_obj_env["actor_param_buffer"] = actor_param_buffer
     ray_obj_actor = {"actor_buffer": actor_buffer,
-                     "actor_param_buffer": actor_param_buffer}    
+                     "actor_param_buffer": actor_param_buffer}   
+
+    if not flags.train_actor: 
+        self_play_buffer = SelfPlayBuffer.options(num_cpus=1).remote(flags=flags)
+        ray_obj_actor["self_play_buffer"] = self_play_buffer
 
     self_play_workers = []
     self_play_workers.extend(

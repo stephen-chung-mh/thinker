@@ -13,8 +13,8 @@ cdef class cSokoban:
 	cdef Sokoban c_sokoban
 	cdef int obs_x, obs_y, obs_n
 
-	def __init__(self, bool small, string level_dir, string img_dir, int level_num, seed=0):
-		self.c_sokoban = Sokoban(small, level_dir, img_dir, level_num, seed)	
+	def __init__(self, bool small, string level_dir, string img_dir, int level_num, int dan_num, seed=0):
+		self.c_sokoban = Sokoban(small, level_dir, img_dir, level_num, dan_num, seed)	
 		self.obs_x = self.c_sokoban.obs_x
 		self.obs_y = self.c_sokoban.obs_y
 		self.obs_n = self.c_sokoban.obs_n
@@ -41,8 +41,9 @@ cdef class cSokoban:
 		cdef float reward = 0.
 		cdef bool done = False
 		cdef bool truncated_done = False
-		self.c_sokoban.step(act, &obs_view[0], reward, done, truncated_done)
-		return obs.reshape(self.obs_x,self.obs_y,3), reward, done, {"step_n": self.step_n, "truncated_done": truncated_done}
+		cdef bool cost = False
+		self.c_sokoban.step(act, &obs_view[0], reward, done, truncated_done, cost)
+		return obs.reshape(self.obs_x,self.obs_y,3), reward, done, {"step_n": self.step_n, "truncated_done": truncated_done, "cost": cost}
 
 	def clone_state(self):
 		cdef np.ndarray room_status = np.zeros((10*10), dtype=np.dtype("u1"))

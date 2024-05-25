@@ -6,9 +6,11 @@ This is the official repository for the paper titled [*Thinker: Learning to Plan
 ## Table of Contents
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+- [Training in Thinker-augmented MDPs](#training-in-thinker-augmented-mdps)
 - [Basic Usage](#basic-usage)
 - [Configuration](#configuration)
 - [Available Environments](#available-environments)
+- [Available Wrappers](#available-wrappers)
 - [Resource Management](#resource-management)
 - [Resuming from a Checkpoint](#resuming-from-a-checkpoint)
 - [API](#api)
@@ -16,7 +18,6 @@ This is the official repository for the paper titled [*Thinker: Learning to Plan
 	- [env.reset](#envreset-method)
 	- [env.step](#envstep-method)
 	- [env.close](#envclose-method)
-- [IMPALA on Thinker-augmented MDP](#impala-on-thinker-augmented-mdp)
 - [Miscellaneous](#miscellaneous)
 
 
@@ -46,7 +47,85 @@ cd thinker
 pip install -e .
 ```
 
-## Basic Usage
+## Training in the Thinker-augmented MDP
+To train actor-critic (IMPALA) on the Thinker-augmented MDP, run the following commands in the `thinker` directory:
+
+Sokoban default run:
+
+```bash
+python train.py
+```
+
+Atari default run (change the environment if needed):
+
+```bash
+python train.py --name BreakoutNoFrameskip-v4 --atari true --reward_clip 1 --model_size_nn 2 --discounting 0.99
+```
+
+- To understand how the Thinker-augmented MDP can be used with an actor-critic network, please refer to [this example notebook](notebook/example.ipynb).
+- The above runs are used to generate the results of the Thinker-augmented MDP in Figure 5 and Figure 9 of the paper, but some hyper-parameters have been optimized further in the current version. To use the same hyper-parameters as in the paper, add `--actor_learning_rate 0.0006`.
+
+**Troubleshooting**
+- If running out of GPU memory, try using mixed precision by adding `--float16 true`.
+- If you encounter errors related to Ray memory, try setting `--ray_mem -1` to allow Ray to allocate memory automatically.
+- The number of GPUs will be detected automatically. A single RTX3090 is sufficient for the Sokoban default run, while two RTX3090s are required for the Atari default run. The number of CPUs and GPUs allocated can be controlled with the `--ray_cpu` and `--ray_gpu` options, e.g., `--ray_cpu 16 --ray_gpu 1` limits usage to 16 CPUs and 1 GPU.
+- To enable logging to wandb, add `--use_wandb true` with the desired experiment ID `--xpid $XPID`. The global variable `$WANDB_USER` should be set to the wandb username. To log visualized episodes, add `--policy_vis_freq 1000000`, which creates a GIF of an animated episode every 1M steps.
+
+### Baselines & Ablation
+
+Some common baselines include:
+
+- IMPALA on the raw MDP:
+```bash
+python train.py --wrapper_type 1 --has_model false --actor_unroll_len 20 --actor_learning_rate 3e-4 --see_real_state true
+```
+
+- MCTS with 99 imagainary steps instead of RL agents (this is equivalent to MuZero but with the Thinker world model):
+```bash
+python train.py --mcts true --tree_carry false --rec_t 100 --actor_unroll_len 200 --max_depth -1 --auto_res False --env_n 256 
+```
+
+- [DRC](https://proceedings.mlr.press/v97/guez19a/guez19a.pdf):
+```bash
+python train.py --drc true --actor_unroll_len 20 --reg_cost 0.01 --actor_learning_rate 4e-4 --entropy_cost 1e-2 --v_trace_lamb 0.97 --actor_adam_eps 1e-4 --has_model false
+```
+
+Some common ablation includes:
+- Thinker-augmentation with environment simluators:
+```bash
+python train.py --wrapper_type 2
+```
+- No RNN for actor:
+```bash
+python train.py --tree_rep_rnn false
+```
+- No auxillary statistics:
+```bash
+python train.py --stat_mask_type 1
+```
+- No planning rewards:
+```bash
+python train.py --im_cost 0.
+```
+
+To save computational cost, you can use only 10 imaginary steps (instead of the default 19), no RNN for the actor, and don't let the actor see the hidden state of the model. On Sokoban, these modifications have minimal impact on performance:
+
+```bash
+python train.py --rec_t 11 --tree_rep_rnn false --see_h false
+```
+
+### Visualizing a Run
+
+To visualize a specific run, follow the steps below:
+
+1.  Identify the experiment ID of the run you want to visualize. By default, it is in the format: `Thinker-{DATE}-{TIME}`. This ID should be displayed in the standard output during your experiment run.    
+2.  Use the following command, replacing `$XPID` with the experiment ID:
+    
+```bash
+python visual.py --xpid $XPID
+```
+
+## Basic Usage of the Thinker-augmented MDP
 
 The Thinker-augmented MDP provides the same interface as OpanAI's Gym. To test if the installation is successful, run the following:
 
@@ -97,12 +176,20 @@ Note that the first method will take precedence over the second method.
 
 ## Available Environments
 
-By default, environments like `Sokoban-v0`, as well as other Atari environments such as `BreakoutNoFrameskip-v4` and `SeaquestNoFrameskip-v4`, can be passed to the `Thinker.make` method. The `Thinker.make` method internally calls `gym.make` using the provided environment name to instantiate the environment. For all environments except `Sokoban-v0`, a pre-defined Atari wrapper is applied. This Atari wrapper includes: 
+By default, environments like `Sokoban-v0`, as well as other Atari environments such as `BreakoutNoFrameskip-v4` and `SeaquestNoFrameskip-v4`, can be passed to the `Thinker.make` method. The `Thinker.make` method internally calls `gym.make` using the provided environment name to instantiate the environment. 
+
+Pass `atari=True` to apply the standard Atari wrapper is applied: 
 - 4-frame stacking, 
 - up to 30 random no-ops at the start, 
 - resizing the image to 3x84x84, 
 - truncating at 108,000 steps, 
 - treating end-of-life as end-of-episode.
+
+Example:
+
+```py
+env = Thinker.make("BreakoutNoFrameskip-v4", atari=True, env_n=16, config='custom.yaml')
+```
 
 You can also provide custom environments. To do this, supply an `env_fn` function that, when invoked as `env_fn()`, returns a Gym environment:
 
@@ -121,6 +208,25 @@ The only requirement is that the `observation_space` of the returned environment
 import gym, gym_sokoban
 env = gym.make("Sokoban-v0")
 ```
+
+## Available Wrappers
+
+There are five different wrapper types available since v1.2, which can be configured via the `wrapper_type` argument:
+
+- `0` (Default): The Thinker-augmentation discussed in the paper.
+- `1`: The raw MDP without any Thinker-augmentation. The return state will only contain real states, as other statistics such as tree representation won't be available. This is mainly for baseline purposes.
+- `2`: The Thinker-augmentation with an environment simulator. Useful for debugging purposes.
+- `3`: Thinker-v2 augmentation (work in progress).
+- `4`: Thinker-v2 augmentation with an environment simulator (work in progress).
+
+The environment simulator means that we have access to the dynamics of the environment, so the state-reward network does not need to be learned, and only the value-prediction network is learned. In such cases, the value-policy network will no longer be an RNN but a simple deep convolution network that predicts the value and policy.
+
+The environment simulator version works with both Sokoban and Atari games. For custom environments, please ensure that the environment has the following two methods:
+
+- `clone_state()`: Returns the savepoint of the environment as a dictionary.
+- `restore_state(state)`: state should be the state returned by `clone_state()`; this loads the environment to the savepoint.
+
+For an illustration, see the `StateWrapper` method in `thinker/thinker/wrapper.py`, which wraps Gym's Atari environments to provide these two methods.
 
 
 ## Resource Management
@@ -253,6 +359,7 @@ state, reward, done, info = env.step(primary_action, reset_action, action_prob=N
 	    -   `0`: A real action was just taken, marking the beginning of a stage.
 	    -   `1`: An imaginary action was just taken, and the next action is an imaginary action.
 	    -   `2`: An imaginary action was just taken, and the next action is a real action. Typically, a stage has a `step_status` of `[0, 1, 1, ..., 1, 2]` , where the count of `1`s equals the stage length `K` minus 2.
+		-   `3`: A real action was just taken, and the next action is a real action. This only occurs when there is no imagaination steps.
 	-   `max_rollout_depth`: Integer tensor representing the greatest depth achieved in all rollouts during the current stage; primarily used for logging.    
 	-   `baseline`: Float tensor representing the mean rollout return at the root node. It is updated only at the end of a stage and can be utilized as a value estimation of the real state underlying the stage.    
 	-   `im_reward`: Float tensor representing the planning rewards.
@@ -286,43 +393,6 @@ The `env.close` method closes the environment, freeing the memory of the model.
 ```py
 env.close()
 ```
-
-## IMPALA on Thinker-augmented MDP
-Run the following commands in the `thinker` directory:
-
-Sokoban default run:
-
-```bash
-python train.py
-```
-
-The above run is used to generate the results of the Thinker-augmented MDP in Figure 5 of the paper.
-
-Atari default run (change the environment if needed):
-
-```bash
-python train.py --name BreakoutNoFrameskip-v4 --reward_clip 1 --model_size_nn 2 --discounting 0.99
-```
-
-
-The above run, combined with that from other Atari games, are used to generate the results of the Thinker-augmented MDP in Figure 9 of the paper.
-
-
-### Visualizing a Run
-
-To visualize a specific run of your experiment, follow the steps below:
-
-1.  Identify the `XPID` (Experiment ID) of the run you want to visualize. By default, it is in the format: `Thinker-{DATE}-{TIME}`. This ID should be displayed in the standard output during your experiment run.    
-2.  Use the following command, replacing `XPID` with the appropriate experiment ID:
-    
-```bash
-python visual.py --xpid XPID
-```
-
-**Note**
-
-1. If you encounter errors related to Ray memory, try setting `--ray_mem -1` to allow Ray to allocate memory automatically.
-2. The number of GPUs will be detected automatically. A single RTX3090 is sufficient for the Sokoban default run, while two RTX3090s are required for the Atari default run. The number of CPUs and GPUs allocated can be controlled with the `--ray_cpu` and `--ray_gpu` options, e.g., `--ray_cpu 16 --ray_gpu 1` limits usage to 16 CPUs and 1 GPU.
 
 ## Miscellaneous
 

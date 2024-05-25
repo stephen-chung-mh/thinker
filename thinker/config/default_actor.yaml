@@ -9,42 +9,74 @@ reward_clip: -1.0 # reward clipping; if positve, the reward is clipped within th
 # training setting
 train_actor: true # whether to train actor
 total_steps: 50000000 # total number of real steps to train
-actor_learning_rate: 0.0006 # actor learning rate
+actor_learning_rate: 0.0003 # actor learning rate
 actor_batch_size: 16 # actor batch size
 actor_unroll_len: 201 # unroll length used to update actor
 actor_use_rms: false # whether to use rms (default: adam) as optimizer
-actor_grad_norm_clipping: 1200 # gradient clipping norm; non-positive for no clipping
+actor_grad_norm_clipping: 0.5 # gradient clipping norm; non-positive for no clipping
 actor_adam_eps: 0.00000001 # eps for Adam optimizer
-return_norm_type: -1 # return norm type; -1 for no normalization, 0 for value normalization, 1 for advantage normalization
+return_norm_type: -1 # return norm type; -1 for no normalization, 0 for value normalization, 1 for advantage normalization, 2 for standard adv normalization
+v_trace_lamb: 1. # lambda used in v-trace
 # cost setting
 im_cost: 1. # cost for imaginary rewards
 im_cost_anneal: true # whether to anneal the imaginary cost to 0
-cur_cost: 0. # cost for curiosity rewards
+cur_cost: 0. # cost for curiosity rewards - unused
 cur_cost_anneal: true # whether to anneal the curiosity cost to 0
 baseline_cost: 0.5 # cost for computing baseline
+entropy_r_cost: 0. # entropy cost added to reward
 entropy_cost: 0.001 # entropy cost for real actions
 im_entropy_cost: 0.0001 # entropy cost for imaginary actions
 reg_cost: 0.001 # regularization cost
-xss_cost: 0. # self-supervised loss for the real state branch
 # actor setting
+# - general
 see_real_state: false # whether to see root real state
 see_tree_rep: true # whether to see tree representation
 see_h: true # whether to see model's hidden state
 see_x: false # whether to see the model's predicted state
-# actor network setting
+legacy: false # whether to use legacy version
+sep_actor_critic: false # whether to separate actor and critic
 drc: false # whether to use the drc baseline
+mcts: false # whether to use the mcts baseline
+# -tree rep processing
 tree_rep_rnn: true # whether to use rnn in processing tree representation
+se_lstm_table: true # whether to use lstm to enablde tables
+# -real state processing
 x_rnn: false # whether to use rnn in processing x, model's predicted state
+h_rnn: false # whether to use rnn in processing h, model's recurrent state
+real_state_rnn: false # whether to use rnn in processing real state
+enc_1d_shallow: false # whether to use shallow encoding (1d input only)
+enc_1d_norm: true # enable layer normalization in 1d encoder
+enc_1d_block: 2 # number of res block for 1d encoder
+enc_1d_hs: 256 # hidden size of 1d encoder
+# -rnn setting
 tran_t: 1 # internal transition step for rnn
 tran_mem_n: 40 # memory slot size for the attention module in lstm-attn
 tran_layer_n: 3 # number of layers of lstm-attn
+tran_head_n: 8 # number of head for each attention layer
 tran_lstm_no_attn: false # whether to disable the attention module in lstm-attn
 tran_attn_b: 5 # initial bias for attending to the current step
 tran_dim: 128 # hidden dimension of lstm-attn
-disable_mem: false # whether to erasing rnn's hidden state on each step
+# -critic setting
 critic_zero_init: true # whether to zero initialize the critic outputs
 critic_enc_type: 0 # reward / value encoding type for the critic; 0 for no encoding, 1 for scalar encoding, 2 for unbiased vector encoding, 3 for biased vector encoding
+critic_enc_f_type: 0 # scalar encoding function for reward / value encoding; 0 for MuZero-like encoding, 1 for Dreamer-like encoding
+# -output setting
 sep_im_head: true # whether to use seperate head for computing imaginary logit
+last_layer_n: 0 # number of hidden layer after concat different branch
+actor_ordinal: false # whether to use ordinal representation in actor's policy
+tanh_action: true # whether to use tanh activation for action (continuous only)
+# -specific setting for continuous policy
+actor_min_std: 0.003 # minimum std of Gaussian policy
+actor_max_std: 10 # maximum std of Gaussian policy
+# PPO-related
+ppo_k: 1 # number of SGD iteration per epoch; set to higher than 1 to enable ppo
+ppo_n: 64 # size of circular buffer
+ppo_kl_coef: 0. # kl coef; i.e. loss cost for KL divergence between target policy and current policy
+ppo_kl_targ: 0.04 # target kl divergence
+ppo_early_stop: false # no more iteration if kl div exceed target
+ppo_syn: false # synchronized buffer
+ppo_clip: 0.3 # clip for is ratio
+ppo_v_trace: true # forcing to use v-trace
 # checkpoint
 xpid: '' # name of the run, automatically set if not given
 ckp: false # whether to load checkpoint; if set to true, will load checkpoint from savedir/xpid
@@ -52,18 +84,19 @@ preload_actor: '' # path for the folder that consists ckp_actor.tar, which is us
 savedir: '../logs/__project__' # base log directory
 use_wandb: false # whether to use wandb; need to have global variable WANDB_USER set to wandb user
 wandb_ckp_freq: 500000 # frequency in real steps to upload all files in the run
-policy_vis_freq: 2000000 # frequency in real steps to visualize the run
+policy_vis_freq: -1 # frequency in real steps to visualize the run
 policy_vis_length: 20 # length of the video visualization
 # misc
 profile: false # whether to output all the time statistics of the run
 parallel_actor: true # whether to use a parallel ray actor for training the actor
+float16: false # whether to use mixed precision
 # ray resources
 auto_res: true # whether to auto allocate gpu
 ray_mem: -1 # default initialized ray memory
 ray_gpu: -1 # number of initial gpu (set to -1 for auto detect)
 ray_cpu: -1 # number of initial cpu (set to -1 for auto detect)
 self_play_n: 1 # number of self-play ray actors (will be set automatically if auto_res is enabled)
-env_n: 16 # number of parallel environment for each self-play ray actors
+env_n: 64 # number of parallel environment for each self-play ray actors
 gpu_self_play: 0.25 # gpu for each self-play ray actor (will be set automatically if auto_res is enabled)
 gpu_learn_actor: 0.25 # gpu for the actor-learning ray actor (will be set automatically if auto_res is enabled)
 gpu_learn: 0.5 # gpu for the model-learning ray actor (will be set automatically if auto_res is enabled)

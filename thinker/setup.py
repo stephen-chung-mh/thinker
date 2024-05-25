@@ -54,7 +54,7 @@ with open("requirements.txt") as fp:
 
 setup(
     name="thinker",
-    version="1.1.0",
+    version="1.2.1",
     packages=["thinker"],
     ext_modules=extensions,
     install_requires=install_requires,

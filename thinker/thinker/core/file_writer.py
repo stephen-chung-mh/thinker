@@ -25,7 +25,7 @@ import logging
 import os
 import time
 from typing import Dict
-
+import warnings
 
 def gather_metadata() -> Dict:
     date_start = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -171,8 +171,11 @@ class FileWriter:
                     self.fieldnames = lines[0]
                     if "# _tick" in self.fieldnames:
                         self.fieldnames = [x if x != "# _tick" else "_tick" for x in self.fieldnames]
-                if len(lines) > 1:
-                    self._tick = int(lines[-2][0]) + 1
+                if len(lines) >= 2 and len(lines[-2]) > 0:
+                    try:
+                        self._tick = int(lines[-2][0]) + 1
+                    except Exception as e:
+                        warnings.warn(f"Warning: An exception occurred: {e}")
             
         self._logfile = open(self.paths["logs"], "a")
         self._logwriter = csv.DictWriter(self._logfile, fieldnames=self.fieldnames)

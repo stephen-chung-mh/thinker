@@ -28,6 +28,12 @@ roomStatus char_to_roomStatus(const char c) {
 		return roomStatus::player_not_on_tar;
 	case '%':
 		return roomStatus::player_on_tar;
+	case '^':
+		return roomStatus::dan;		
+	case '&':
+		return roomStatus::box_on_dan;		
+	case '*':
+		return roomStatus::player_on_dan;						
 	}
 	return roomStatus::wall;
 }
@@ -49,6 +55,12 @@ char roomStatus_to_char(const roomStatus r) {
 		return '@';
 	case roomStatus::player_on_tar:
 		return '%';
+	case roomStatus::dan:
+		return '^';		
+	case roomStatus::box_on_dan:
+		return '&';		
+	case roomStatus::player_on_dan:
+		return '*';			
 	}
 	return '#';
 }
@@ -96,6 +108,9 @@ void Sokoban::read_spirits() {
 	read_bmp(img_dir, "player" + s, spirites[4]);
 	read_bmp(img_dir, "player_on_target" + s, spirites[5]);
 	read_bmp(img_dir, "box_target" + s, spirites[6]);
+	read_bmp(img_dir, "dan" + s, spirites[7]);
+	read_bmp(img_dir, "box_on_dan" + s, spirites[8]);
+	read_bmp(img_dir, "player_on_dan" + s, spirites[9]);
 	defEngine = std::mt19937(seed);
 }
 
@@ -122,10 +137,14 @@ void Sokoban::move_pos(const action a, int& x, int& y) {
 void Sokoban::move_player(roomStatus& old_r, roomStatus& new_r) {
 	if (old_r == roomStatus::player_on_tar)
 		old_r = roomStatus::tar;
+	else if (old_r == roomStatus::player_on_dan)
+		old_r = roomStatus::dan;
 	else
 		old_r = roomStatus::empty;
 	if (new_r == roomStatus::tar)
 		new_r = roomStatus::player_on_tar;
+	else if (new_r == roomStatus::dan)
+		new_r = roomStatus::player_on_dan;
 	else
 		new_r = roomStatus::player_not_on_tar;
 	return;
@@ -139,6 +158,8 @@ float Sokoban::move_box(roomStatus& old_r, roomStatus& new_r) {
 		reward += reward_box_off;
 		box_left++;
 	}
+	else if (old_r == roomStatus::box_on_dan)
+		old_r = roomStatus::dan;
 	else
 		old_r = roomStatus::empty;
 	if (new_r == roomStatus::tar) {
@@ -150,6 +171,8 @@ float Sokoban::move_box(roomStatus& old_r, roomStatus& new_r) {
 			done = true;
 		}
 	}
+	else if (new_r == roomStatus::dan)
+		new_r = roomStatus::box_on_dan;
 	else
 		new_r = roomStatus::box_not_on_tar;
 	return reward;
@@ -174,14 +197,14 @@ float Sokoban::move(const action a) {
 			if (new_r == roomStatus::wall) {
 				return reward_step;
 			} 
-			else if (new_r == roomStatus::empty || new_r == roomStatus::tar)
+			else if (new_r == roomStatus::empty || new_r == roomStatus::tar || new_r == roomStatus::dan)
 			{
 				move_player(old_r, new_r);
 				player_pos_x = new_pos_x;
 				player_pos_y = new_pos_y;
 				return reward_step;
 			}
-			else if (new_r == roomStatus::box_not_on_tar || new_r == roomStatus::box_on_tar)
+			else if (new_r == roomStatus::box_not_on_tar || new_r == roomStatus::box_on_tar || new_r == roomStatus::box_on_dan)
 			{
 				int new_box_pos_x = new_pos_x, new_box_pos_y = new_pos_y;
 				move_pos(a, new_box_pos_x, new_box_pos_y);
@@ -190,7 +213,7 @@ float Sokoban::move(const action a) {
 					}
 				else{
 					roomStatus& new_box_r = room_status[new_box_pos_y][new_box_pos_x];
-					if (new_box_r == roomStatus::empty || new_box_r == roomStatus::tar) {
+					if (new_box_r == roomStatus::empty || new_box_r == roomStatus::tar || new_box_r == roomStatus::dan) {
 						float reward = move_box(new_r, new_box_r);
 						move_player(old_r, new_r);
 						player_pos_x = new_pos_x;
@@ -223,11 +246,12 @@ int Sokoban::read_level(const int room_id)
 	box_left = 0;
 	done = false;
 
-	char file_name[20];
-	snprintf(file_name, 20, "%03d.txt", room_id / 1000);
+	char file_name[10];
+	snprintf(file_name, 10, "%03d.txt", room_id / 1000);
 	string full_path = level_dir + "//" + file_name;
 	//std::cout << "reading from " << full_path << " level " << room_id << endl;
 	ifstream in(full_path.c_str(), ios::in);
+	vector<pair<int, int>> empty_positions;
 	if (in.is_open())
 	{
 		string line;
@@ -247,12 +271,26 @@ int Sokoban::read_level(const int room_id)
 						player_pos_y = n - m - 1;
 					}
 					else if (r == roomStatus::box_not_on_tar) box_left++;
+					else if (r == roomStatus::empty) empty_positions.push_back(make_pair(n - m - 1, x)); 
 					x++;
 				}
 			}
 		};
 		in.close();
 	}
+	// Randomly shuffle empty positions
+
+    // Create a vector of indices and shuffle it
+    std::vector<int> indices(empty_positions.size());
+    std::iota(indices.begin(), indices.end(), 0);  // Fill with 0, 1, ..., size-1
+    std::shuffle(indices.begin(), indices.end(), defEngine);
+
+    // Change first n empty tiles to roomStatus::dan
+    for(int i = 0; i < min(dan_num, (int)empty_positions.size()); i++) {
+        auto pos = empty_positions[indices[i]];
+        room_status[pos.first][pos.second] = roomStatus::dan;
+    }
+
     if (box_left != 4) {
         std::ostringstream error_msg;
         error_msg << "box_left must be equal to 4 (room_id: " << room_id << ")";
@@ -307,7 +345,7 @@ void Sokoban::reset_level(unsigned char* obs, const int room_id) {
 	render(obs);
 }
 
-void Sokoban::step(const action a, unsigned char* obs, float& reward, bool& done, bool& truncated_done) {
+void Sokoban::step(const action a, unsigned char* obs, float& reward, bool& done, bool& truncated_done, bool& cost) {
 	reward = move(a);		
 	if (step_n >= max_step_n - 1) {
 		this->done = true;
@@ -317,12 +355,13 @@ void Sokoban::step(const action a, unsigned char* obs, float& reward, bool& done
 		step_n++;	
 		truncated_done = false;
 	}
+	cost = (room_status[player_pos_y][player_pos_x] == roomStatus::player_on_dan);
 	done = this->done;
 	render(obs);
 }
 
-void Sokoban::step(const int a, unsigned char* obs, float& reward, bool& done, bool& truncated_done) {
-	if (a >= 0 && a <= 4) step(action(a), obs, reward, done, truncated_done);
+void Sokoban::step(const int a, unsigned char* obs, float& reward, bool& done, bool& truncated_done, bool& dan) {
+	if (a >= 0 && a <= 4) step(action(a), obs, reward, done, truncated_done, dan);
 	else throw invalid_argument("invalid action");
 }
 
@@ -342,7 +381,7 @@ void Sokoban::restore_state(const unsigned char* room_status, const int& step_n,
 		for (int x = 0; x < room_x; x++) {
 			roomStatus r = (roomStatus)room_status[y * room_x + x];
 			this->room_status[y][x] = r;
-			if (r == roomStatus::player_not_on_tar || r == roomStatus::player_on_tar) {
+			if (r == roomStatus::player_not_on_tar || r == roomStatus::player_on_tar || r == roomStatus::player_on_dan) {
 				player_pos_y = y;
 				player_pos_x = x;
 			}

@@ -1,54 +1,95 @@
 # the setting for default Thinker environment
-# training setting
+# model training setting
+has_model: true # whether the model exists
 train_model: true # whether to train the model
 model_batch_size: 128 # training batch size of the model
 model_learning_rate: 0.0001 # model learning rate
-model_grad_norm_clipping: 0 # gradient clipping norm; non-positive for no clipping
-min_replay_ratio: 5 # minimum replay ratio (i.e. the number of times that the same transition is used to train a model on average)
-max_replay_ratio: 6 # maximum replay ratio (i.e. the number of times that the same transition is used to train a model on average)
+model_optimizer: 'adam' # can be adam or sgd
+model_sgd_momentum: 0.9
+model_sgd_weight_decay: 0.0001
+model_grad_norm_clipping: 0. # gradient clipping norm; non-positive for no clipping
+min_replay_ratio: 4. # minimum replay ratio (i.e. the number of times that the same transition is used to train a model on average)
+max_replay_ratio: 5. # maximum replay ratio (i.e. the number of times that the same transition is used to train a model on average)
 total_steps: 50000000 # total number of raw steps to train
 # replay buffer setting
 priority_alpha: 0.6 # alpha in prioritized sampling from the buffer
 priority_beta: 0.4 # beta in prioritized sampling from the buffer
-buffer_traj_len: 50 # length of trajectory stored in the replay buffer
-model_unroll_len: 5 # model unroll length and also the n in n-step return when training model
-model_warm_up_n: 200000 # number of augmented step before model starts to be trained
+model_unroll_len: 5 # model unroll length when training model
+model_mem_unroll_len: 0 # model unroll length for computing initial model state (only needed when model_has_memory is true)
+model_return_n: 5 # n-step return when training model
+model_warm_up_n: 10000 # number of augmented step before model starts to be trained
 model_buffer_n: 200000 # capacity of replay buffer in number of augmented step 
 # cost setting in training
-model_logits_loss_cost: 0.5 # cost for training model's policy
+model_policy_loss_cost: 0.5 # cost for training model's policy
 model_vs_loss_cost: 0.25 # cost for training model's values
 model_rs_loss_cost: 1.0 # cost for training model's reward
 model_done_loss_cost: 1.0 # cost for training model's done signal
-model_img_loss_cost: 10.0 # cost for training model's state output (dual network only)
+model_img_loss_cost: 0.0 # cost for training model's state output (L2 loss) (dual network only)
+model_fea_loss_cost: 10.0 # cost for training model's state output (feature loss) (dual network only)
 model_reg_loss_cost: 0.0 # cost for model regularization loss
+model_noise_loss_cost: 0.0 # cost for model noise loss
+fea_loss_inf_bn: false # whether to use inference mode for vp-net when computing feature loss
+img_fea_cos: false # whether to use cosine similarity loss for img_loss and fea_loss
 # model setting
 dual_net: true # whether to use dual network
-model_enc_type: 0 #  reward / value encoding type for the model; 0 for no encoding, 1 for scalar encoding, 2 for unbiased vector encoding, 3 for biased vector encoding
+model_decoder_depth: 0 # decoder level; can be from 0 to 4; 0 mean predicing raw image, 4 mean predicting vp_net feature directly
+model_enc_type: 0 # reward / value encoding type for the model; 0 for no encoding, 1 for scalar encoding, 2 for unbiased vector encoding, 3 for biased vector encoding
+model_enc_f_type: 0 # scalar encoding function for reward / value encoding; 0 for MuZero-like encoding, 1 for Dreamer-like encoding
 model_size_nn: 1 # model size mulitplier (integer)
-model_downscale_c: 2 # model channel size divisor (integer)
+model_downscale_c: 2 # model channel size divisor (integer) - state reward network
+model_downscale_c_vp: 2 # model channel size divisor (integer) - value policy network
 model_disable_bn: true # whether to disable batch norm in model
 model_zero_init: true # whether to zero initialize the model's predicted rewards and values
-model_img_type: 1 # type of model's state loss: 0 for L2 loss, 1 for feature loss
-# wrapper to be used
+model_has_memory: false # whether to enable memory in model
+model_ordinal: false # whether to use ordinal representation in model's policy
+vp_fix_bootstrap: false # vp use fixed bootstrap target at the last unroll step
+# wrapper for env
+discrete_k: -1 # bin used to discretize the action space; -1 for no discretizing
+obs_norm: false # whether to normalize obs by running avg mean and std
+obs_clip: -1 # observation clipping; if positve, the obs is clipped within the absolute value of this values; set to negative number for no clipping
+reward_norm: false # whether to normalize reward by running avg mean and std
+reward_clip: -1 # reward clipping; if positve, the reward is clipped within the absolute value of this values; set to negative number for no clipping
+# core wrapper setting
+wrapper_type: 0 # 0: default Thinker; 1: raw env; 2: Thinker w/ perfect model; 3: Thinker-v2; 4: Thinker-v2 w/ perfect model
 require_prob: false # whether to use prob to train model instead of sampled action
-wrapper_type: 0 # 0: default Thinker; 1: raw env; 2: Thinker w/ perfect model; 
 rec_t: 20 # stage length
 test_rec_t: -1 # stage length for testing; non-positive for being the same as rec_t
 max_depth: 5 # maximum search depth before forceful reset
 tree_carry: true # whether to carry the tree across stages
+reset_mode: 0 # 0 for conventional thinker; 1 for no expansion if reset - return the root node as the current node
 return_h: true # whether to return model's hidden state
 return_x: false # whether to return the model's predicted state
-return_double: false # whether to return both root node and current node's h / raw_s
+has_action_seq: true # whether tree rep contains action sequence
+# sepcific setting for Thinker-v2
+se_query_size: 20 # size of query table in wrapper_type 3
+se_td_lambda: 0.9 # lambda for discounting td err in wrapper_type 3
+se_query_cur: 2 # 0 for no query on current nodes; 1 for query on current nodes; 2 for query on both current & root nodes & enable node carry
+se_buffer_n: 20 # buffer size of the keys
+se_tree_carry: true # whether to enable tree carry
+se_manual_stat: false # manual summing to compute n(s,a) and q(s,a); for discrete-action only
+# sampled-based search
+sample_n: -1 # number of sampled action; <0 for disabling sample mode
+sample_temp: 4 # whether to use sampled action in imagination
+sample_replace: true # whether to have replcaement when sampling action
 # reward-related
-discounting: 0.99 # discount rate of the raw MDP
-reward_clip: -1 # reward clipping; if positve, the reward is clipped within the absolute value of this values; set to negative number for no clipping
+discounting: 0.97 # discount rate of the raw MDP
 im_enable: true # whether to return imagainary reward
-cur_enable: false # whether to return curiosity reward
-cur_reward_cost: 0.0 # coefficient for curiosity loss based on reward prediction loss
-cur_v_cost: 0.0 # coefficient for curiosity loss based on value prediction loss
-cur_enc_cost: 0.0 # coefficient for curiosity loss based on state prediction loss (in terms of feature loss)
-cur_done_gate: false # whehter to give no curiosity reward when episode ends or is predicted to end
 stat_mask_type: 0 # masking hint in tree representation: 0: no masking, 1 for masking all auxiliary stat, 2 for masking all auxiliary node stat + v and pi
+# stochasic model
+noise_enable: false # enable vae model
+noise_n: 16 # number of catogorical variable
+noise_d: 10 # number of category for each variable
+noise_alpha: 0.8 # alpha for kl divergence rebalancing
+noise_mlp: false # use 2-layer mlp to compress noise
+# general wrapper setting
+atari: false # whether to use atari wrapper
+grayscale: false # whether to apply grayscale for atari
+repeat_action_n: 0 # custom frame stacking (only for non-Atari envrionment)
+rand_action_eps: 0. # probability of randomly setting to 0 action
+# Sokoban-related setting
+sokoban_pomdp: false # whether to randomly mixing the location of agent in Sokoban
+# env-specific setting
+dm_rgb: false # whether to use rgb for dm control suite
 # checkpoint
 xpid: '' # name of the run, automatically set if not given
 ckp: false # whether to load checkpoint; if set to true, will load checkpoint from savedir/xpid
@@ -58,7 +99,9 @@ savedir: 'logs' # base log directory
 # misc
 profile: false # whether to output all the time statistics of the run
 parallel: false # whether to use a parallel ray actor for training the model
+float16: false # whether to use mixed precision
 base_seed: 1 # base seed for the gym environment
+project: ''
 # ray resources
 ray_mem: -1 # default initialized ray memory
 ray_gpu: -1 # number of initial gpu (set to -1 for auto detect)

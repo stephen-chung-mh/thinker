@@ -60,7 +60,7 @@ with open("requirements.txt") as fp:
 
 setup(
     name="gym_sokoban",
-    version="1.0.0",
+    version="1.0.1",
     packages=["gym_sokoban"],
     ext_modules=extensions,
     install_requires=install_requires,
@@ -71,7 +71,7 @@ setup(
 def decompress_data():
     data_zip = os.path.join(os.path.dirname(__file__), 'resources.zip')
     extract_folder = os.path.join(os.path.dirname(__file__), 'gym_sokoban', 'envs')
-    if os.path.exists(os.path.join(extract_folder, 'boxoban-levels')): return        
+    # if os.path.exists(os.path.join(extract_folder, 'boxoban-levels')): return        
     
     with zipfile.ZipFile(data_zip, 'r') as zip_ref:
         zip_ref.extractall(extract_folder)

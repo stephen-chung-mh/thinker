@@ -4,13 +4,15 @@ import cv2
 import torch
 import gym
 from gym import spaces
+import thinker.util as util
+import time
 
 class DummyWrapper(gym.Wrapper):
     """DummyWrapper that represents the core wrapper for the real env;
     the only function is to convert returning var into tensor
     and reset the env when it is done.
     """
-    def __init__(self, env, env_n, flags, model_net, device=None, time=False):   
+    def __init__(self, env, env_n, flags, model_net, device=None, timing=False):   
         gym.Wrapper.__init__(self, env)
         self.env_n = env_n
         self.flags = flags
@@ -18,69 +20,94 @@ class DummyWrapper(gym.Wrapper):
         self.observation_space = spaces.Dict({
             "real_states": self.env.observation_space,
         })        
-        self.norm_low = self.env.observation_space.low[0]
-        self.norm_high = self.env.observation_space.high[0]
+        if env.observation_space.dtype == 'uint8':
+            self.state_dtype = torch.uint8
+        elif env.observation_space.dtype == 'float32':
+            self.state_dtype = torch.float32
+        else:
+            raise Exception(f"Unupported observation sapce", env.observation_space)
+
+        self.train_model = self.flags.train_model
+        action_space =  env.action_space[0]
+        self.num_actions, self.dim_actions, self.dim_rep_actions, self.tuple_action, self.discrete_action = \
+            util.process_action_space(action_space)
 
     def reset(self, model_net):
         obs = self.env.reset()
-        obs_py = torch.tensor(obs, dtype=torch.uint8, device=self.device)
-        states = {"real_states": obs_py,
-                  }       
-        if self.flags.return_x:
-            with torch.set_grad_enabled(False):
-                states["xs"] = (obs_py.float() - self.norm_low) / \
-                            (self.norm_high -  self.norm_low)
+        obs_py = torch.tensor(obs, dtype=self.state_dtype, device=self.device)                
+        if self.train_model: 
+            self.per_state = model_net.initial_state(batch_size=self.env_n, device=self.device)
+            pri_action = torch.zeros(self.env_n, self.dim_actions, dtype=torch.long, device=self.device)
+            done = torch.zeros(self.env_n, dtype=torch.bool, device=self.device)
+            with torch.no_grad():
+                model_net_out = model_net(
+                    env_state=obs_py, 
+                    done=done,
+                    actions=pri_action.unsqueeze(0), 
+                    state=self.per_state,)       
+            self.per_state = model_net_out.state
+            self.baseline = model_net_out.vs[-1]
+        states = {"real_states": obs_py}       
         return states 
 
     def step(self, action, model_net):  
         # action in shape (B, *) or (B,)
-        if len(action.shape) > 1:
-            action = action[:, 0]
         if torch.is_tensor(action):
-            action = action.detach().cpu().numpy()
+            action = action.detach().cpu().numpy()        
 
         obs, reward, done, info = self.env.step(action) 
         if np.any(done):
             done_idx = np.arange(self.env_n)[done]
-            obs_reset = self.env.reset(done_idx)
-            
-        real_done = [m["real_done"] if "real_done" in m else done[n] for n, m in enumerate(info)]
-        truncated_done = [m["truncated_done"] if "truncated_done" in m else False for n, m in enumerate(info)]
-        obs_py = torch.tensor(obs, dtype=torch.uint8, device=self.device)
-        if np.any(done):
-            obs_py[done] = torch.tensor(obs_reset, dtype=torch.uint8, device=self.device)
-
+            obs_reset = self.env.reset(idx=done_idx)
+            obs[done] = obs_reset
+        obs_py = torch.tensor(obs, dtype=self.state_dtype, device=self.device)
+        reward = torch.tensor(reward, dtype=torch.float32, device=self.device)
+        done = torch.tensor(done, dtype=torch.bool, device=self.device)        
         states = {
             "real_states": obs_py,
         }     
-  
-        info = {"real_done": torch.tensor(real_done, dtype=torch.bool, device=self.device),
-                "truncated_done": torch.tensor(truncated_done, dtype=torch.bool, device=self.device),                
-                "step_status": torch.zeros(self.env_n, dtype=torch.long, device=self.device),
-                }
-        if self.flags.return_x:
-            with torch.set_grad_enabled(False):
-                states["xs"] = (obs_py.float() - self.norm_low) / \
-                            (self.norm_high -  self.norm_low)
+
+        info = util.dict_map(info, lambda x: torch.tensor(x, device=self.device))
+        info["step_status"] = torch.full((self.env_n,), fill_value=3, dtype=torch.long, device=self.device)
+        info["real_states_np"] = obs
         
-        return (states, 
-                torch.tensor(reward, dtype=torch.float32, device=self.device), 
-                torch.tensor(done, dtype=torch.bool, device=self.device), 
-                info)
-    
-    def unnormalize(self, x):
-        assert x.dtype == torch.float or x.dtype == torch.float32
-        ch = x.shape[-3]
-        x = torch.clamp(x, 0, 1)
-        x = x * (self.norm_high[-ch:] -  self.norm_low[-ch:]) + self.norm_low[-ch:]
-        return x
+        if self.train_model:             
+            info["initial_per_state"] = self.per_state
+            info["baseline"] = self.baseline
+            pri_action = torch.tensor(action, dtype=torch.long, device=self.device)
+            if not self.tuple_action: pri_action = pri_action.unsqueeze(-1)          
+            with torch.no_grad():
+                model_net_out = model_net(
+                    env_state=obs_py, 
+                    done=done,
+                    actions=pri_action.unsqueeze(0), 
+                    state=self.per_state,)       
+                self.per_state = model_net_out.state
+                self.baseline = model_net_out.vs[-1]
+        
+        return states, reward, done, info
     
 class PostWrapper(gym.Wrapper):
     """Wrapper for recording episode return, clipping rewards"""
-    def __init__(self, env, reward_clip):
+    def __init__(self, env, flags, device):
         gym.Wrapper.__init__(self, env)
-        self.reset_called = False
-        self.reward_clip = reward_clip
+        self.reset_called = False        
+        low = torch.tensor(self.env.observation_space["real_states"].low[0])
+        high = torch.tensor(self.env.observation_space["real_states"].high[0])
+        self.need_norm = torch.isfinite(low).all() and torch.isfinite(high).all()
+        self.norm_low = low
+        self.norm_high = high
+
+        self.disable_thinker = flags.wrapper_type == 1
+        if not self.disable_thinker:
+            self.pri_action_space = self.env.action_space[0][0]            
+        else:
+            self.pri_action_space = self.env.action_space[0]
+        self.num_actions, self.dim_actions, self.dim_rep_actions, self.tuple_action, self.discrete_action = \
+            util.process_action_space(self.pri_action_space)
+        if not self.discrete_action:
+            self.action_space_low = torch.tensor(self.pri_action_space.low, dtype=torch.float, device=device)
+            self.action_space_high = torch.tensor(self.pri_action_space.high, dtype=torch.float, device=device)
     
     def reset(self, model_net):
         state = self.env.reset(model_net)
@@ -92,7 +119,7 @@ class PostWrapper(gym.Wrapper):
         )
 
         self.episode_return = {}
-        for key in ["re", "im", "cur"]:
+        for key in ["im", "cur"]:
             self.episode_return[key] = torch.zeros(
                 self.env_n, dtype=torch.float, device=self.device
             )
@@ -101,33 +128,64 @@ class PostWrapper(gym.Wrapper):
 
     def step(self, action, model_net):
         assert self.reset_called, "need to call reset ONCE before step"
+
+        if not self.discrete_action:            
+            if not self.disable_thinker:
+                pri_action, reset_action = action
+                pri_action = ((pri_action + 1) / 2) * (self.action_space_high - self.action_space_low) + self.action_space_low
+                pri_action = torch.clamp(pri_action, -1, +1)
+                action = (pri_action, reset_action)
+            else:
+                action = torch.clamp(action, self.action_space_low, self.action_space_high)
+
         state, reward, done, info = self.env.step(action, model_net)
-        real_done = info["real_done"]
-
-        self.episode_step += 1
-        info["episode_step"] = self.episode_step.clone()
-        self.episode_step[real_done] = 0
-
-        self.episode_return["re"] += reward
-        info["episode_return"] = self.episode_return["re"].clone()
-        self.episode_return["re"][real_done] = 0.
+        real_done = info["real_done"]        
 
         for prefix in ["im", "cur"]:
             if prefix+"_reward" in info:
-                self.episode_return[prefix] += info[prefix+"_reward"]
+                nan_mask = ~torch.isnan(info[prefix+"_reward"])
+                self.episode_return[prefix][nan_mask] += info[prefix+"_reward"][nan_mask]
                 info[prefix + "_episode_return"] = self.episode_return[prefix].clone()
                 self.episode_return[prefix][real_done] = 0.
                 if prefix == "im":
-                    self.episode_return[prefix][info["step_status"] == 0] = 0.
-        
-        if self.reward_clip > 0.:
-            reward = torch.clamp(reward, -self.reward_clip, +self.reward_clip)
+                    self.episode_return[prefix][info["step_status"] == 0] = 0.        
         return state, reward, done, info
+    
+    def render(self, *args, **kwargs):  
+        return self.env.render(*args, **kwargs)    
+    
+    def unnormalize(self, x):
+        assert x.dtype == torch.float or x.dtype == torch.float32
+        if self.need_norm:
+            ch = x.shape[-3]
+            x = torch.clamp(x, 0, 1)
+            x = x * (self.norm_high[-ch:] -  self.norm_low[-ch:]) + self.norm_low[-ch:]
+        return x
+    
+    def normalize(self, x):
+        if self.need_norm:    
+            if self.norm_low.device != x.device or self.norm_high.device != x.device:
+                self.norm_low = self.norm_low.to(x.device)
+                self.norm_high = self.norm_high.to(x.device)
+            x = (x.float() - self.norm_low) / (self.norm_high -  self.norm_low)
+        return x
 
-def PreWrapper(env, name, grayscale=False, frame_wh=96):
-    if "Sokoban" in name:
-        env = TransposeWrap(env)
-    else:
+def PreWrapper(env, name, flags):
+    grayscale = flags.grayscale
+    discrete_k = flags.discrete_k 
+    repeat_action_n = flags.repeat_action_n
+    rand_action_eps = flags.rand_action_eps
+    sokoban_pomdp = flags.sokoban_pomdp
+    atari = flags.atari
+    
+    if sokoban_pomdp: env = Sokoban_POMDP(env)
+    if discrete_k > 0: env = DiscretizeActionWrapper(env, K=discrete_k)
+    if repeat_action_n > 0: env = RepeatActionWrapper(env, repeat_action_n=repeat_action_n)      
+    if rand_action_eps > 0.: env = RandomZeroActionWrapper(env, eps=rand_action_eps)
+    if "NoFrameskip" in name and not atari: 
+        raise Exception(f"{name} is likely an Atari game but flags.Atari is False")
+    if atari: 
+        # atari
         env = StateWrapper(env)
         env = TimeLimit_(env, max_episode_steps=108000)
         env = NoopResetEnv(env, noop_max=30)
@@ -140,10 +198,34 @@ def PreWrapper(env, name, grayscale=False, frame_wh=96):
             frame_stack=True,
             scale=False,
             grayscale=grayscale,
-            frame_wh=frame_wh,
+            frame_wh=96,
         )
-        env = TransposeWrap(env)
+    if env.observation_space.dtype == np.float64:
+        env = ScaledFloatFrame(env)
+    if isinstance(env.observation_space, gym.spaces.Box) and len(env.observation_space.shape) == 3:
+        #old_env_obs_space = env.observation_space.shape        
+        # 3d input, need transpose
+        env = TransposeWrap(env)      
+        #new_env_obs_space = env.observation_space.shape  
+        #print(f"Added transpose wrapper for {old_env_obs_space} => {new_env_obs_space}")
     return env
+
+def create_env_fn(name, flags):
+    if "Sokoban" in name:
+        import gym_sokoban
+        fn = gym.make
+        args = {"id": name}
+    else:
+        fn = gym.make
+        args = {"id": name}
+
+    env_fn = lambda: PreWrapper(
+        fn(**args), 
+        name=name, 
+        flags=flags,
+    )
+    return env_fn
+    
 
 # Standard wrappers
 
@@ -154,8 +236,8 @@ class TransposeWrap(gym.ObservationWrapper):
         super(TransposeWrap, self).__init__(env)
         old_shape = self.observation_space.shape
         self.observation_space = gym.spaces.Box(
-            low=0,
-            high=255,
+            low=self.observation_space.low.transpose(2, 0, 1),
+            high=self.observation_space.high.transpose(2, 0, 1),
             shape=(old_shape[-1], old_shape[0], old_shape[1]),
             dtype=np.uint8,
         )
@@ -343,7 +425,9 @@ class EpisodicLifeEnv(gym.Wrapper):
         """
         gym.Wrapper.__init__(self, env)
         self.lives = 0
-        self.was_real_done = True
+        self.was_real_done = False
+        self.was_done = False
+        self.init = False
 
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
@@ -358,6 +442,7 @@ class EpisodicLifeEnv(gym.Wrapper):
             # the environment advertises done.
             done = True
         self.lives = lives
+        self.was_done = done
         return obs, reward, done, info
 
     def reset(self, **kwargs):
@@ -365,12 +450,16 @@ class EpisodicLifeEnv(gym.Wrapper):
         This way all states are still reachable even though lives are episodic,
         and the learner need not know about any of this behind-the-scenes.
         """
-        if self.was_real_done:
+        if self.was_real_done or not self.was_done:
             obs = self.env.reset(**kwargs)
+            if not self.was_done and self.init:
+                #print("Warning: Resetting when episode is not done.")
+                pass
         else:
             # no-op step to advance from terminal/lost life state
             obs, _, _, _ = self.env.step(0)
         self.lives = self.env.unwrapped.ale.lives()
+        self.init = True
         return obs
 
     def clone_state(self):
@@ -478,18 +567,6 @@ class FrameStack(gym.Wrapper):
             self.frames.append(i)
         self.env.restore_state(state)
 
-class ScaledFloatFrame(gym.ObservationWrapper):
-    def __init__(self, env):
-        gym.ObservationWrapper.__init__(self, env)
-        self.observation_space = gym.spaces.Box(
-            low=0, high=1, shape=env.observation_space.shape, dtype=np.float32
-        )
-
-    def observation(self, observation):
-        # careful! This undoes the memory optimization, use
-        # with smaller replay buffers only.
-        return np.array(observation).astype(np.float32) / 255.0
-
 class LazyFrames(object):
     def __init__(self, frames):
         """This object ensures that common frames between the observations are only stored once.
@@ -540,18 +617,413 @@ class StateWrapper(gym.Wrapper):
         # self.env.restore_state(state["ale_state"])
         self.env.restore_state(state["ale_state"])
 
-
 class ScaledFloatFrame(gym.ObservationWrapper):
-    def __init__(self, env):
-        gym.ObservationWrapper.__init__(self, env)
+    def __init__(self, env):        
+        """
+        An environment wrapper that scales observations from uint8 to float32 and
+        normalizes them if they are uint8. If observations are float64, it converts them to float32 without normalization.
+        """
+        super(ScaledFloatFrame, self).__init__(env)
+        assert self.env.observation_space.dtype in [np.uint8, np.float64]
+
+        # Determine if the original observation space is uint8
+        self.is_uint8 = self.env.observation_space.dtype == np.uint8
+        # Adjust the observation space to reflect the change in dtype
         self.observation_space = gym.spaces.Box(
-            low=0, high=1, shape=env.observation_space.shape, dtype=np.float32
+            low=self.env.observation_space.low if not self.is_uint8 else 0,
+            high=self.env.observation_space.high if not self.is_uint8 else 1,
+            shape=self.env.observation_space.shape,
+            dtype=np.float32
         )
 
     def observation(self, observation):
-        # careful! This undoes the memory optimization, use
-        # with smaller replay buffers only.
-        return np.array(observation).astype(np.float32) / 255.0
+        # Convert observation to float32
+        observation = np.array(observation, dtype=np.float32)        
+        # Normalize only if the original observation space was uint8
+        if self.is_uint8: observation = observation / 255.0
+        return observation
+    
+class RandomZeroActionWrapper(gym.ActionWrapper):
+    def __init__(self, env, eps=0.05):
+        super().__init__(env)
+        self.eps = eps
+
+    def action(self, action):
+        # Check if we should randomize the action
+        if np.random.rand() < self.eps:
+            if isinstance(self.action_space, gym.spaces.Discrete):
+                return 0  # For discrete action space, action 0
+            elif isinstance(self.action_space, gym.spaces.Box):
+                return np.zeros(self.action_space.shape)  # For continuous action space, vector of zeros
+            else:
+                raise NotImplementedError("Unsupported action space for randomization")
+        return action  
+    
+class Sokoban_POMDP(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+    
+    def observation(self, obs):        
+        int_state = self.env.clone_state()
+        room_status = int_state['sokoban_room_status'].reshape(10, 10)
+        agent_y, agent_x = np.nonzero((room_status == 4) | (room_status == 5) | (room_status == 9))
+        #if len(agent_y) == 0: print(room_status)
+        agent_y, agent_x = agent_y[0], agent_x[0]
+        rand_actions = [0]
+        if room_status[np.clip(agent_y-1, 0, 9), np.clip(agent_x, 0, 9)] not in [0, 2, 3]:
+            rand_actions += [1]
+        if room_status[np.clip(agent_y+1, 0, 9), np.clip(agent_x, 0, 9)] not in [0, 2, 3]:    
+            rand_actions += [2]
+        if room_status[np.clip(agent_y, 0, 9), np.clip(agent_x-1, 0, 9)] not in [0, 2, 3]:    
+            rand_actions += [3]    
+        if room_status[np.clip(agent_y, 0, 9), np.clip(agent_x+1, 0, 9)] not in [0, 2, 3]:    
+            rand_actions += [4]    
+        rand_action = rand_actions[np.random.randint(len(rand_actions))]
+        if rand_action != 0:
+            obs_, _, done, _ = self.env.step(rand_action)
+            if not done: obs = obs_
+            self.env.restore_state(int_state)
+        return obs    
+
+class RepeatActionWrapper(gym.Wrapper):
+    def __init__(self, env, repeat_action_n):
+        super().__init__(env)
+        self.repeat_action_n = repeat_action_n
+
+        # Adjust observation space for stacked observations
+        orig_obs_space = env.observation_space
+        self.obs_shape = orig_obs_space.shape
+        new_shape = (*self.obs_shape[:-1], self.obs_shape[-1] * repeat_action_n)
+        self.observation_space = gym.spaces.Box(
+            low=np.tile(orig_obs_space.low, repeat_action_n),
+            high=np.tile(orig_obs_space.high, repeat_action_n),
+            shape=new_shape,
+            dtype=orig_obs_space.dtype
+        )
+
+        self.stacked_obs = np.zeros(new_shape, dtype=orig_obs_space.dtype)
+
+    def reset(self):
+        initial_obs = self.env.reset()
+        self.stacked_obs = np.tile(initial_obs, self.repeat_action_n)
+        return self.stacked_obs
+
+    def step(self, action):
+        total_reward = 0.0
+        done = False
+        info = {}
+
+        for i in range(self.repeat_action_n):
+            obs, reward, done, info = self.env.step(action)
+            total_reward += reward
+
+            # Update the stacked observation
+            start_index = i * self.obs_shape[-1]
+            end_index = start_index + self.obs_shape[-1]
+            self.stacked_obs[..., start_index:end_index] = obs
+
+            if done:
+                # Fill the remaining slots with the last observation if done
+                for j in range(i + 1, self.repeat_action_n):
+                    start_index = j * self.obs_shape[-1]
+                    end_index = start_index + self.obs_shape[-1]
+                    self.stacked_obs[..., start_index:end_index] = obs
+                break
+
+        return self.stacked_obs, total_reward, done, info
+
+class DiscretizeActionWrapper(gym.ActionWrapper):
+    def __init__(self, env, K=11):
+        super().__init__(env)
+        self.K = K  # Number of bins for discretization
+
+        # Infer min and max actions from the original environment
+        self.min_action = self.env.action_space.low
+        self.max_action = self.env.action_space.high
+
+        # Ensure the original action space is a Box
+        assert isinstance(env.action_space, gym.spaces.Box), "The action space must be of type gym.spaces.Box"
+
+        # Define the new action space as a tuple of Discrete(K) spaces
+        self.action_space = spaces.Tuple([spaces.Discrete(K) for _ in range(env.action_space.shape[0])])
+
+    def action(self, action):
+        # Convert the discrete action to continuous action using vectorized operations
+        action = np.array(action)  # Ensure action is a NumPy array
+        discrete_to_cont = (action / (self.K - 1)) * (self.max_action - self.min_action) + self.min_action
+        return discrete_to_cont
+
+
+# wrapper for normalization
+
+class NormalizeObservation(gym.core.Wrapper):
+    """This wrapper will normalize observations s.t. each coordinate is centered with unit variance.
+
+    Note:
+        The normalization depends on past trajectories and observations will not be normalized correctly if the wrapper was
+        newly instantiated or the policy was changed recently.
+    """
+
+    def __init__(self, env: gym.Env, epsilon: float = 1e-8):
+        """This wrapper will normalize observations s.t. each coordinate is centered with unit variance.
+
+        Args:
+            env (Env): The environment to apply the wrapper
+            epsilon: A stability parameter that is used when scaling the observations.
+        """
+        super().__init__(env)
+        self.is_vector_env = getattr(env, "is_vector_env", False)
+        if self.is_vector_env:
+            self.obs_rms = util.RunningMeanStd(shape=self.single_observation_space.shape)
+        else:
+            self.obs_rms = util.RunningMeanStd(shape=self.observation_space.shape)
+        self.epsilon = epsilon
+
+    def step(self, action, **kwargs):
+        obs, rews, dones, infos = self.env.step(action, **kwargs)
+        if self.is_vector_env:
+            obs = self.normalize(obs)
+        else:
+            obs = self.normalize(np.array([obs]))[0]
+        return obs, rews, dones, infos    
+
+    def reset(self, **kwargs):
+        """Resets the environment and normalizes the observation."""
+        obs = self.env.reset(**kwargs)
+
+        if self.is_vector_env:
+            return self.normalize(obs)
+        else:
+            return self.normalize(np.array([obs]))[0]
+
+    def normalize(self, obs):
+        """Normalises the observation using the running mean and variance of the observations."""
+        self.obs_rms.update(obs)
+        return (obs - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + self.epsilon)   
+    
+    def clone_state(self, idx=None):
+        state = self.env.clone_state(idx)
+        if idx is None: idx = range(self.num_envs)
+        for n, i in enumerate(idx):
+            state[n]["obs_mean"] = self.obs_rms.mean
+            state[n]["obs_var"] = self.obs_rms.var
+            state[n]["obs_count"] = self.obs_rms.count
+        return state
+    
+    def restore_state(self, state, idx=None):
+        self.env.restore_state(state, idx)
+        if idx is None: idx = range(self.num_envs)        
+        self.obs_rms.mean = state[0]["obs_mean"]
+        self.obs_rms.var = state[0]["obs_var"]
+        self.obs_rms.count = state[0]["obs_count"]
+
+    def load_ckp(self, data):
+        self.obs_rms.mean = data['obs_mean']
+        self.obs_rms.var = data['obs_var']
+        self.obs_rms.count = data['obs_count']
+        self.env.load_ckp(data)
+
+    def save_ckp(self):
+        data = self.env.save_ckp()
+        data["obs_mean"] = self.obs_rms.mean
+        data["obs_var"] = self.obs_rms.var
+        data["obs_count"] = self.obs_rms.count
+        return data
+
+class NormalizeReward(gym.core.Wrapper):
+    def __init__(
+        self,
+        env,
+        gamma=0.99,
+        epsilon=1e-8,
+    ):
+        super().__init__(env)
+        self.num_envs = getattr(env, "num_envs", 1)
+        self.is_vector_env = getattr(env, "is_vector_env", False)
+        self.return_rms = util.RunningMeanStd(shape=())
+        self.returns = np.zeros(self.num_envs)
+        self.gamma = gamma
+        self.epsilon = epsilon
+
+    def step(self, action, **kwargs):
+        obs, rews, dones, infos = self.env.step(action, **kwargs)
+        if not self.is_vector_env:
+            rews = np.array([rews])
+        self.returns = self.returns * self.gamma + rews
+        rews = self.normalize(rews)
+        self.returns[dones] = 0.0
+        if not self.is_vector_env:
+            rews = rews[0]
+        return obs, rews, dones, infos
+
+    def normalize(self, rews):
+        self.return_rms.update(self.returns)
+        return rews / np.sqrt(self.return_rms.var + self.epsilon)
+    
+    def clone_state(self, idx=None):
+        state = self.env.clone_state(idx)
+        if idx is None: idx = range(self.num_envs)
+        for n, i in enumerate(idx):
+            state[n]["return_mean"] = self.return_rms.mean
+            state[n]["return_var"] = self.return_rms.var
+            state[n]["return_count"] = self.return_rms.count
+            state[n]["return_cur"] = self.returns[i]
+        return state
+    
+    def restore_state(self, state, idx=None):
+        self.env.restore_state(state, idx)
+        if idx is None: idx = range(self.num_envs)        
+        self.return_rms.mean = state[0]["return_mean"]
+        self.return_rms.var = state[0]["return_var"]
+        self.return_rms.count = state[0]["return_count"]
+        for n, i in enumerate(idx):
+            self.returns[i] = state[n]["return_cur"]
+
+    def load_ckp(self, data):
+        self.return_rms.mean = data['return_mean']
+        self.return_rms.var = data['return_var']
+        self.return_rms.count = data['return_count']
+        self.env.load_ckp(data)
+
+    def save_ckp(self):
+        data = self.env.save_ckp()
+        data["return_mean"] = self.return_rms.mean
+        data["return_var"] = self.return_rms.var
+        data["return_count"] = self.return_rms.count
+        return data
+
+    
+class InfoConcat(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        assert self.is_vector_env
+        self.num_envs = getattr(env, "num_envs", 1)        
+
+    def step(self, action, **kwargs):
+        obs, reward, done, info = self.env.step(action, **kwargs) 
+        real_done = np.array([m["real_done"] if "real_done" in m else done[n] for n, m in enumerate(info)], dtype=np.bool_)
+        truncated_done = np.array([m["truncated_done"] if "truncated_done" in m else False for n, m in enumerate(info)], dtype=np.bool_)
+        cost = np.array([m["cost"] if "cost" in m else False for n, m in enumerate(info)], dtype=np.bool_)
+        info = {
+            "real_done": real_done,
+            "truncated_done": truncated_done,
+            "cost": cost,
+        }
+        return obs, reward, done, info
+    
+    def default_info(self):
+        info = {
+            "real_done": np.zeros(self.num_envs, dtype=np.bool_),
+            "truncated_done": np.zeros(self.num_envs, dtype=np.bool_),
+            "cost": np.zeros(self.num_envs, dtype=np.bool_),
+        }
+        return info
+    
+    def clone_state(self, idx=None):
+        return self.env.clone_state(idx)
+    
+    def restore_state(self, state, idx=None):
+        return self.env.restore_state(state, idx)
+    
+    def load_ckp(self, data):
+        return 
+    
+    def save_ckp(self):
+        return {}
+
+class RecordEpisodeStatistics(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.num_envs = getattr(env, "num_envs", 1)        
+        self.episode_return = np.zeros(self.num_envs, dtype=np.float32)
+        self.episode_step = np.zeros(self.num_envs, dtype=np.int64)
+
+    def reset(self, **kwargs):
+        idx = kwargs.get("idx", None)     
+        reset_stat = kwargs.get("reset_stat", False)  
+        if "reset_stat" in kwargs: kwargs.pop("reset_stat")
+        if reset_stat:
+            if idx is None:
+                self.episode_return = np.zeros(self.num_envs, dtype=np.float32)
+                self.episode_step = np.zeros(self.num_envs, dtype=np.int64)
+            else:
+                self.episode_return[idx] = 0.
+                self.episode_step[idx] = 0
+
+        return self.env.reset(**kwargs)
+
+    def step(self, action, **kwargs):        
+        idx = kwargs.get("idx", None)     
+        obs, reward, done, info = self.env.step(action, **kwargs)
+        real_done = info["real_done"]
+        if idx is None:
+            self.episode_return = self.episode_return + reward
+            self.episode_step = self.episode_step + 1
+        else:
+            self.episode_return[idx] = self.episode_return[idx] + reward
+            self.episode_step[idx] = self.episode_step[idx] + 1
+        episode_return = self.episode_return
+        episode_step = self.episode_step
+
+        if np.any(real_done):
+            episode_return = np.copy(episode_return)
+            episode_step = np.copy(episode_step)
+
+            if idx is None:    
+                self.episode_return[real_done] = 0.
+                self.episode_step[real_done] = 0
+            else:
+                idx_b = np.zeros(self.num_envs, np.bool_)
+                idx_b[idx] = real_done
+                self.episode_return[idx_b] = 0.
+                self.episode_step[idx_b] = 0
+                
+        info["episode_return"] = episode_return[idx] if idx is not None else episode_return
+        info["episode_step"] = episode_step[idx] if idx is not None else episode_return
+        return obs, reward, done, info
+    
+    def default_info(self):
+        info = self.env.default_info()
+        info["episode_return"] =  np.zeros(self.num_envs, dtype=np.float32)
+        info["episode_step"] =  np.zeros(self.num_envs, dtype=np.int64)
+        return info
+    
+    def clone_state(self, idx=None):
+        state = self.env.clone_state(idx)
+        if idx is None: idx = range(self.num_envs)
+        for n, i in enumerate(idx):
+            state[n]["episode_return"] = self.episode_return[i]
+            state[n]["episode_step"] = self.episode_step[i]
+        return state
+    
+    def restore_state(self, state, idx=None):
+        self.env.restore_state(state, idx)
+        if idx is None: idx = range(self.num_envs)
+        for n, i in enumerate(idx):
+            self.episode_return[i] = state[n]["episode_return"]
+            self.episode_step[i] = state[n]["episode_step"]
+
+class TransformReward(gym.Wrapper):
+    r"""Transform the reward via an arbitrary function."""
+    def __init__(self, env, f):
+        super().__init__(env)
+        assert callable(f)
+        self.f = f
+    
+    def step(self, action, **kwargs):
+        observation, reward, done, info = self.env.step(action, **kwargs)
+        return observation, self.f(reward), done, info
+
+class TransformObservation(gym.Wrapper):
+    r"""Transform the reward via an arbitrary function."""
+    def __init__(self, env, f):
+        super().__init__(env)
+        assert callable(f)
+        self.f = f
+    
+    def step(self, action, **kwargs):
+        observation, reward, done, info = self.env.step(action, **kwargs)
+        return self.f(observation), reward, done, info
 
 def wrap_deepmind(
     env,

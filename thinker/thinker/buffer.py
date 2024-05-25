@@ -1,27 +1,13 @@
 import numpy as np
 import time
+import timeit
 from operator import itemgetter
+import os
 import ray
 import thinker.util as util
 from thinker.core.file_writer import FileWriter
 import torch
 AB_CAN_WRITE, AB_FULL, AB_FINISH = 0, 1, 2
-
-def custom_choice(tran_n, batch_size, p, replace=False):
-    if np.any(np.isnan(p)):
-        p[np.isnan(p)] = 0.01
-        p /= p.sum()
-
-    non_zero_count = np.count_nonzero(p)
-    if non_zero_count < batch_size and not replace:
-        # Set zero probabilities to 0.01
-        zero_indices = np.where(p == 0)[0]
-        p[zero_indices] = 0.01
-        # Scale the remaining probabilities
-        p /= p.sum()
-
-    return np.random.choice(tran_n, batch_size, p=p, replace=replace)
-
 
 @ray.remote
 class ActorBuffer:
@@ -78,7 +64,7 @@ class ActorBuffer:
             )
         )
         output_state = tuple(
-            np.concatenate([state[i] for state in collected_state], axis=1)
+            np.concatenate([state[i] for state in collected_state], axis=0)
             for i in range(len(collected_state[0]))
         )
 
@@ -94,7 +80,7 @@ class ActorBuffer:
             )
             self.buffer.insert(0, extra_data)
             extra_state = tuple(
-                state[:, -collected_size + self.batch_size :, ...]
+                state[-collected_size + self.batch_size :, ...]
                 for state in output_state
             )
             self.buffer_state.insert(0, extra_state)
@@ -107,7 +93,7 @@ class ActorBuffer:
                 )
             )
             output_state = tuple(
-                state[:, : self.batch_size, ...] for state in output_state
+                state[: self.batch_size, ...] for state in output_state
             )
 
         return output, output_state
@@ -115,158 +101,152 @@ class ActorBuffer:
     def set_finish(self):
         self.finish = True
 
-
 class SModelBuffer:
-    def __init__(self, flags):
-        self.alpha = flags.priority_alpha
-        self.t = flags.buffer_traj_len
-        self.k = flags.model_unroll_len
-        self.max_buffer_n = flags.model_buffer_n // self.t + 1  # maximum buffer length
-        self.batch_size = flags.model_batch_size  # batch size in returned sample
-        self.wram_up_n = (
-            flags.model_warm_up_n if not flags.ckp else flags.model_buffer_n
-        )  # number of total transition before returning samples
+    def __init__(self, buffer_n, max_rank, batch_size, alpha=1., warm_up_n=0):
+        self.buffer_n = buffer_n                
+        self.max_rank = max_rank
+        self.batch_size = batch_size        
+        self.alpha = alpha
+        self.warm_up_n = warm_up_n
+        self.B = max_rank * batch_size
+        self.T = buffer_n // self.B + 1
+        self.processed_n = 0
+        self.filled_t = np.zeros(self.B, dtype=np.int64)        
+        self.idx = np.zeros(self.B, dtype=np.int64)
+        self.initialized = False       
+        self.finish = False 
+        self.frame_stack_n = 1
 
-        self.buffer = []
+    def init_buffer(self, data):
+        self.keys = list(data.keys()) # all inputs are of shape (B, *)    
+        self.buffer = {}
+        for key in self.keys:            
+            v = data[key]
+            self.buffer[key] = np.zeros((self.T, self.B) + v.shape[1:], dtype=v.dtype,)                    
+        self.priority = np.zeros((self.T, self.B))
+        self.priority[0] = 1. # for computing max priority correctly in first loop
+        self.read_time = np.full((self.T, self.B), np.nan)
+        self.write_time = np.zeros((self.T, self.B))
+        self.initialized = True
 
-        self.priorities = None
-        self.next_inds = None
-        self.cur_inds = {}
-
-        self.base_ind = 0
-        self.abs_tran_n = 0
-        self.clean_m = 0
-
-        self.finish = False
-
-    def write(self, data, rank):
-        # data is a named tuple with elements of size (t+2*k-1, n, ...)
-        n = data[0].shape[1]
-
-        for m in range(n):
-            self.buffer.append(util.tuple_map(data, lambda x: x[:, m]))
-
-        p_shape = self.t * n
-        if self.priorities is None:
-            self.priorities = np.ones((p_shape), dtype=float)
+    def write(self, data, rank, idx=None, priority=None):
+        # data is a dict of numpy array, each with shape (batch_size, *).          
+        if idx is None:
+            b = self.batch_size      
         else:
-            max_priorities = np.full(
-                (p_shape), fill_value=self.priorities.max(), dtype=float
-            )
-            self.priorities = np.concatenate([self.priorities, max_priorities])
-
-        # to record a table for chaining entry
-        if rank in self.cur_inds.keys():
-            last_ind = self.cur_inds[rank] - self.base_ind
-            mask = last_ind >= 0
-            self.next_inds[last_ind[mask]] = (
-                len(self.next_inds) + self.base_ind + np.arange(n)
-            )[mask]
-
-        if self.next_inds is None:
-            self.next_inds = np.full((n), fill_value=np.nan,)
+            b = len(idx)
+        self.processed_n += b
+        if not self.initialized: self.init_buffer(data)
+        if idx is None:
+            b_idx = np.arange(rank*self.batch_size, (rank+1)*self.batch_size)
         else:
-            self.next_inds = np.concatenate(
-                [self.next_inds, np.full((n), fill_value=np.nan)]
-            )
-        self.cur_inds[rank] = len(self.next_inds) + self.base_ind - n + np.arange(n)
-        self.abs_tran_n += self.t * n
+            b_idx = rank*self.batch_size+idx
+        for key in self.keys:                 
+            assert data[key].shape[0] == b, f"{key} should have shape ({b}, *) instead of {data[key].shape} (idx: {idx}; self.batch_size:{self.batch_size})"
+            self.buffer[key][self.idx[b_idx], b_idx] = data[key]                    
+        
+        if priority is not None:
+            assert priority.shape == (b,), f"priority should have shape ({b},) instead of {priority.shape}"
+            self.priority[self.idx[b_idx], b_idx] = priority
+        else:
+            self.priority[self.idx[b_idx], b_idx] = max(self.priority.max(), 1e-8)
+        self.filled_t[b_idx] = np.minimum(self.filled_t[b_idx]+1, self.T)
+        self.read_time[self.idx[b_idx], b_idx] = 0
+        self.idx[b_idx] = (self.idx[b_idx] + 1) % self.T            
 
-        # clean periordically
-        self.clean()
+    def read(self, t, b, beta=1., add_t=0):
+        # Sample a trajectory with shape (t, b, *)
+        # items in add_keys will have shape (t+add_t, b)        
+        add_keys = ["baseline", "reward", "done", "truncated_done", "action_prob", "action"] 
 
-    def read(self, beta):
-        if self.priorities is None or self.abs_tran_n < self.wram_up_n:
-            return None
-        if self.finish:
-            return "FINISH"
-        return self.prepare(beta)
+        if self.finish: return "FINISH"
+        if not self.initialized: return None
+        priority_ = self.priority.copy()        
+        for i in range(1, t + add_t + self.frame_stack_n - 1): priority_[self.idx - i] = 0.
+        sample_n = np.sum((priority_ > 0).astype(np.float32)) 
+        if sample_n < b or self.processed_n < self.warm_up_n: return None
 
-    def prepare(self, beta):
-        buffer_n = len(self.buffer)
-        tran_n = len(self.priorities)
-        probs = self.priorities**self.alpha
-        probs /= probs.sum()
-        flat_inds = custom_choice(tran_n, self.batch_size, p=probs, replace=False)
+        flat_priority = priority_.flatten()
+        p = (flat_priority**self.alpha)
+        p = p / max(p.sum(), 1e-8)
+        flat_idx = np.random.choice(flat_priority.size, size=b, p=p, replace=False)
+        t_idx, b_idx = np.unravel_index(flat_idx, priority_.shape)
+        idx = (t_idx, b_idx, self.write_time[t_idx, b_idx])
 
-        inds = np.unravel_index(flat_inds, (buffer_n, self.t))
+        weights = (sample_n * p[flat_idx]) ** (-beta)
+        weights /= weights.max()               
 
-        weights = (tran_n * probs[flat_inds]) ** (-beta)
-        weights /= weights.max()
+        data = {}
+        for key in self.keys:
+            if key == "real_state" and self.frame_stack_n > 1: continue
+            t_ = t if key not in add_keys else t + add_t
+            data[key] = np.zeros((t_, b) + self.buffer[key].shape[2:], dtype=self.buffer[key].dtype)
 
-        data = []
-        for d in range(len(self.buffer[0])):
-            elems = []
-            for i in range(self.batch_size):
-                elems.append(
-                    self.buffer[inds[0][i]][d][
-                        inds[1][i] : inds[1][i] + 2 * self.k, np.newaxis
-                    ]
-                )
-            data.append(np.concatenate(elems, axis=1))
-        data = type(self.buffer[0])(*data)
-
-        base_ind_pri = self.base_ind * self.t
-        abs_flat_inds = flat_inds + base_ind_pri
-        return data, weights, abs_flat_inds, self.abs_tran_n
-
-    def set_finish(self):
-        self.finish = True
-
+        t_idx_ = t_idx
+        for i in range(t + add_t):            
+            for key in self.keys:
+                if key == "real_state" and self.frame_stack_n > 1: continue
+                if i >= t and key not in add_keys: continue
+                data[key][i] = self.buffer[key][t_idx_, b_idx]          
+            if i < t: self.read_time[t_idx_, b_idx] += 1
+            t_idx_ =  (t_idx_ + 1) % self.T
+        if self.frame_stack_n > 1:
+            frame = np.zeros((t + self.frame_stack_n - 1, b) + self.buffer["real_state"].shape[2:], dtype=self.buffer["real_state"].dtype)
+            t_idx_ = (t_idx - self.frame_stack_n + 1) % self.T
+            for i in range(t + self.frame_stack_n - 1):    
+                frame[i] = self.buffer["real_state"][t_idx_, b_idx]
+                t_idx_ =  (t_idx_ + 1) % self.T
+            data["real_state"] = stack_frame(frame, self.frame_stack_n, done=data["done"])
+        avg_replay_ratio = np.nanmean(self.read_time)
+        
+        return {"data": data, 
+                "replay_ratio": avg_replay_ratio, 
+                "processed_n": self.processed_n,
+                "weights": weights,
+                "idx": idx,
+                }
+    
+    def check_avail(self, t, b):
+        if not self.initialized: return False
+        priority_ = self.priority.copy()
+        for i in range(1, t): priority_[self.idx - i] = 0.
+        sample_n = np.sum((priority_ > 0).astype(np.float32)) 
+        return sample_n >= b
+    
     def get_status(self):
-        return {"processed_n": self.abs_tran_n,
-                "warm_up_n": self.wram_up_n,
-                "running": self.abs_tran_n >= self.wram_up_n,
-                "finish": self.finish,
-                 }
+        return {"processed_n": self.processed_n,
+                "warm_up_n": self.warm_up_n,
+                "replay_ratio": np.nanmean(self.read_time) if self.initialized else 0,
+                "running": self.processed_n >= self.warm_up_n,
+                "finish": self.finish,                
+                 }    
+    
+    def set_frame_stack_n(self, frame_stack_n):
+        self.frame_stack_n = frame_stack_n
+    
+    def set_finish(self):
+        self.finish = True    
 
-    def update_priority(self, abs_flat_inds, priorities):
-        """Update priority in the buffer; both input
-        are np array of shape (update_size,)"""
-        base_ind_pri = self.base_ind * self.t
+    def update_priority(self, idx, priority):
+        """Update priority in the buffer"""
+        t_idx, b_idx, write_time = idx
+        mask = self.write_time[t_idx, b_idx] == write_time        
+        t_idx, b_idx, priority = t_idx[mask], b_idx[mask], priority[mask]
+        self.priority[t_idx, b_idx] = np.maximum(priority, 1e-8)
 
-        # abs_flat_inds is an array of shape (model_batch_size,)
-        # priorities is an array of shape (model_batch_size, k)
-        priorities = priorities.transpose()
+@ray.remote
+class ModelBuffer(SModelBuffer):
+    pass
 
-        flat_inds = abs_flat_inds - base_ind_pri  # get the relative index
-        mask = flat_inds >= 0
-        flat_inds = flat_inds[mask]
-        priorities = priorities[mask]
-
-        flat_inds = flat_inds[:, np.newaxis] + np.arange(
-            self.k
-        )  # flat_inds now stores uncarried indexes
-        flat_inds_block = flat_inds // self.t  # block index of flat_inds
-        carry_mask = ~(flat_inds_block[:, [0]] == flat_inds_block).reshape(-1)
-        # if first index block is not the same as the later index block, we need to carry it
-
-        flat_inds = flat_inds.reshape(-1)
-        flat_inds_block = flat_inds_block.reshape(-1)
-        carry_inds_block = (
-            self.next_inds[flat_inds_block[carry_mask] - 1] - self.base_ind
-        )  # the correct index block
-
-        flat_inds = flat_inds.astype(float)
-        flat_inds[carry_mask] = (
-            flat_inds[carry_mask]
-            + (-flat_inds_block[carry_mask] + carry_inds_block) * self.t
-        )
-
-        priorities = priorities.reshape(-1)
-        mask = ~np.isnan(flat_inds) & ~np.isnan(priorities)
-        flat_inds = flat_inds[mask].astype(int)
-        priorities = priorities[mask]
-        self.priorities[flat_inds] = priorities
-
-    def clean(self):
-        buffer_n = len(self.buffer)
-        if buffer_n > self.max_buffer_n:
-            excess_n = buffer_n - self.max_buffer_n
-            del self.buffer[:excess_n]
-            self.next_inds = self.next_inds[excess_n:]
-            self.priorities = self.priorities[excess_n * self.t :]
-            self.base_ind += excess_n
+def stack_frame(frame, frame_stack_n, done):
+    T, B, C, H, W = frame.shape[0] - frame_stack_n + 1, frame.shape[1], frame.shape[2], frame.shape[3], frame.shape[4]
+    assert done.shape[0] >= T
+    done = done[:T]
+    y = np.zeros((T, B, C * frame_stack_n, H, W), dtype=frame.dtype)
+    for s in range(frame_stack_n):
+        y[:, :, s*C:(s+1)*C, :, :] = frame[s:T+s]
+        y[:, :, s*C:(s+1)*C, :, :][done] = frame[frame_stack_n - 1: T + frame_stack_n - 1][done]
+    return y
 
 @ray.remote
 class GeneralBuffer(object):
@@ -363,7 +343,6 @@ class RecordBuffer(object):
         self._logger.info(print_str)
         return self.real_step
 
-
 class RetBuffer:
     def __init__(self, max_actor_id, mean_n=400):
         """
@@ -383,6 +362,7 @@ class RetBuffer:
         )  # store the processed data size
         self.max_actor_id = max_actor_id
         self.mean_n = mean_n
+        self.max_return = 0.
         self.all_filled = False
 
     def insert(self, returns, actor_ids):
@@ -411,6 +391,7 @@ class RetBuffer:
             self.return_buffer_n[actor_id] = min(
                 self.return_buffer_n[actor_id] + 1, self.return_buffer.shape[1]
             )
+            self.max_return = max(r, self.max_return)
 
         if not self.all_filled:
             # check if all filled
@@ -418,11 +399,18 @@ class RetBuffer:
                 self.return_buffer_n >= self.return_buffer.shape[1]
             )
 
-    def insert_raw(self, episode_returns, ind, actor_id, done):
+    def insert_raw(self, episode_returns, ind, actor_id, done):                
+        if torch.is_tensor(episode_returns):
+            episode_returns = episode_returns.detach().cpu().numpy()
+        if torch.is_tensor(actor_id):
+            actor_id = actor_id.detach().cpu().numpy()
+        if torch.is_tensor(done):
+            done = done.detach().cpu().numpy()
+
         episode_returns = episode_returns[done][:, ind]
-        episode_returns = tuple(episode_returns.detach().cpu().numpy())
-        done_ids = actor_id.broadcast_to(done.shape)[done]
-        done_ids = tuple(done_ids.detach().cpu().numpy())
+        episode_returns = tuple(episode_returns)
+        done_ids = np.broadcast_to(actor_id, done.shape)[done]
+        done_ids = tuple(done_ids)
         self.insert(episode_returns, done_ids)
 
     def get_mean(self):
@@ -446,3 +434,173 @@ class RetBuffer:
             else:
                 overall_mean = 0.0
         return overall_mean
+
+    def get_max(self):
+        return self.max_return
+
+@ray.remote
+class SelfPlayBuffer:    
+    def __init__(self, flags):
+        # A ray actor tailored for logging across self-play worker; code mostly from learn_actor
+        self.flags = flags
+        self._logger = util.logger()
+
+        max_actor_id = (
+            self.flags.self_play_n * self.flags.env_n
+        )
+
+        self.ret_buffers = [RetBuffer(max_actor_id, mean_n=400)]
+        if self.flags.im_cost > 0.:
+            self.ret_buffers.append(RetBuffer(max_actor_id, mean_n=20000))
+        if self.flags.cur_cost > 0.:
+            self.ret_buffers.append(RetBuffer(max_actor_id, mean_n=400))      
+        
+        self.plogger = FileWriter(
+            xpid=flags.xpid,
+            xp_args=flags.__dict__,
+            rootdir=flags.savedir,
+            overwrite=not self.flags.ckp,
+        )
+
+        self.rewards_ls = ["re"]
+        if flags.im_cost > 0.0:
+            self.rewards_ls += ["im"]
+        if flags.cur_cost > 0.0:
+            self.rewards_ls += ["cur"]
+        self.num_rewards = len(self.rewards_ls)
+
+        self.step, self.real_step, self.tot_eps = 0, 0, 0        
+        self.ckp_path = os.path.join(flags.ckpdir, "ckp_self_play.tar")
+        if flags.ckp: 
+            if not os.path.exists(self.ckp_path):
+                self.ckp_path = os.path.join(flags.ckpdir, "ckp_actor.tar")
+            if not os.path.exists(self.ckp_path):
+                raise Exception(f"Cannot find checkpoint in {flags.ckpdir}/ckp_self_play.tar or {flags.ckpdir}/ckp_actor.tar")
+            self.load_checkpoint(self.ckp_path)
+
+        self.timer = timeit.default_timer
+        self.start_time = self.timer()
+        self.sps_buffer = [(self.step, self.start_time)] * 36
+        self.sps = 0
+        self.sps_buffer_n = 0
+        self.sps_start_time, self.sps_start_step = self.start_time, self.step
+        self.ckp_start_time = int(time.strftime("%M")) // 10
+        
+
+    def insert(self, step_status, episode_return, episode_step, real_done, actor_id):
+
+        stats = {}
+
+        T, B, *_ = episode_return.shape
+        last_step_real = (step_status == 0) | (step_status == 3)
+        next_step_real = (step_status == 2) | (step_status == 3)
+
+        # extract episode_returns
+        if np.any(real_done):            
+            episode_returns = episode_return[real_done][
+                :, 0
+            ]
+            episode_returns = tuple(episode_returns)
+            episode_lens = episode_step[real_done]
+            episode_lens = tuple(episode_lens)
+            done_ids = np.broadcast_to(actor_id, real_done.shape)[real_done]
+            done_ids = tuple(done_ids)
+        else:
+            episode_returns, episode_lens, done_ids = (), (), ()
+
+        self.ret_buffers[0].insert(episode_returns, done_ids)
+        stats = {"rmean_episode_return": self.ret_buffers[0].get_mean()}
+
+        for prefix in ["im", "cur"]:            
+            if prefix == "im":
+                done = next_step_real
+            elif prefix == "cur":
+                done = real_done
+            
+            if prefix in self.rewards_ls:            
+                n = self.rewards_ls.index(prefix)
+                self.ret_buffers[n].insert_raw(
+                    episode_return,
+                    ind=n,
+                    actor_id=actor_id,
+                    done=done,
+                )
+                r = self.ret_buffers[n].get_mean()
+                stats["rmean_%s_episode_return" % prefix] = r
+
+        self.step += T * B
+        self.real_step += np.sum(last_step_real).item()
+        self.tot_eps += np.sum(real_done).item()
+
+        stats.update({
+            "step": self.step,
+            "real_step": self.real_step,
+            "tot_eps": self.tot_eps,
+            "episode_returns": episode_returns,
+            "episode_lens": episode_lens,
+            "done_ids": done_ids,
+        })
+
+        # write to log file
+        self.plogger.log(stats)
+
+        # print statistics
+        if self.timer() - self.start_time > 5:
+            self.sps_buffer[self.sps_buffer_n] = (self.step, self.timer())
+
+            self.sps_buffer_n = (self.sps_buffer_n + 1) % len(self.sps_buffer)
+            self.sps = (
+                self.sps_buffer[self.sps_buffer_n - 1][0]
+                - self.sps_buffer[self.sps_buffer_n][0]
+            ) / (
+                self.sps_buffer[self.sps_buffer_n - 1][1]
+                - self.sps_buffer[self.sps_buffer_n][1]
+            )
+            tot_sps = (self.step - self.sps_start_step) / (
+                self.timer() - self.sps_start_time
+            )
+            print_str = (
+                "[%s] Steps %i @ %.1f SPS (%.1f). Eps %i. Ret %f (%f/%f)."
+                % (
+                    self.flags.xpid,
+                    self.real_step,
+                    self.sps,
+                    tot_sps,
+                    self.tot_eps,
+                    stats["rmean_episode_return"],
+                    stats.get("rmean_im_episode_return", 0.),
+                    stats.get("rmean_cur_episode_return", 0.),
+                )
+            )            
+            self._logger.info(print_str)
+            self.start_time = self.timer()
+            self.queue_n = 0     
+
+        if int(time.strftime("%M")) // 10 != self.ckp_start_time:
+            self.save_checkpoint()
+            self.ckp_start_time = int(time.strftime("%M")) // 10     
+
+        return self.real_step  
+    
+    def save_checkpoint(self):
+        self._logger.info("Saving self-play checkpoint to %s" % self.ckp_path)
+        d = {
+                "step": self.step,
+                "real_step": self.real_step,
+                "tot_eps": self.tot_eps,
+                "ret_buffers": self.ret_buffers,
+                "flags": vars(self.flags),
+            }      
+        try:
+            torch.save(d, self.ckp_path + ".tmp")
+            os.replace(self.ckp_path + ".tmp", self.ckp_path)
+        except:       
+            pass
+
+    def load_checkpoint(self, ckp_path: str):
+        train_checkpoint = torch.load(ckp_path, torch.device("cpu"))
+        self.step = train_checkpoint["step"]
+        self.real_step = train_checkpoint["real_step"]
+        self.tot_eps = train_checkpoint["tot_eps"]
+        self.ret_buffers = train_checkpoint["ret_buffers"]
+        self._logger.info("Loaded self-play checkpoint from %s" % ckp_path)
