@@ -47,6 +47,14 @@ cd thinker
 pip install -e .
 ```
 
+If you encounter the following error:
+
+```
+ERROR: Could not find a version that satisfies the requirement ale-py~=0.7.4; extra == "atari" (from gym[atari]) (from versions: 0.8.0, 0.8.1, 0.9.0)
+```
+
+downgrade the Python version to 3.10 or below. Alternatively, you can remove `gym[atari]==0.22.0` from `thinker/requirements.txt` if you do not intend to run experiments on Atari.
+
 ## Training in Thinker-augmented MDPs
 To train actor-critic (IMPALA) on the Thinker-augmented MDP, run the following commands in the `thinker` directory:
 
